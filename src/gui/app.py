@@ -68,7 +68,7 @@ class PatchCraftApp(App[None]):
         load_credits_on_mount: bool = True,
     ) -> None:
         super().__init__()
-        self.default_model = default_model or "deepseek/deepseek-chat"
+        self.default_model = default_model or "openrouter/deepseek/deepseek-chat"
         self.max_retries = max_retries
         self.load_credits_on_mount = load_credits_on_mount
         self._issues: list[dict] = []

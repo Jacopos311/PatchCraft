@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any, Mapping, Optional, Sequence, Type, Union, overload
 
@@ -39,10 +40,16 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_BACKOFF_SECONDS = 1.0
 DEFAULT_MAX_BACKOFF_SECONDS = 16.0
 
+# Cap on completion output tokens. Requesting very large budgets (e.g. 16384)
+# makes OpenRouter reject the call with HTTP 402 (insufficient credits) even
+# when the account still has enough balance for a smaller generation.
+# Overridable via the PATCHCRAFT_MAX_OUTPUT_TOKENS environment variable.
+DEFAULT_MAX_OUTPUT_TOKENS = max(1, int(os.getenv("PATCHCRAFT_MAX_OUTPUT_TOKENS", "3000")))
+
 DEFAULT_MODELS: Mapping[str, str] = {
-    "deepseek": "deepseek/deepseek-chat",
-    "anthropic": "anthropic/claude-3-7-sonnet-latest",
-    "openai": "openai/gpt-4o",
+    "deepseek": "openrouter/deepseek/deepseek-chat",
+    "anthropic": "openrouter/anthropic/claude-3.5-sonnet",
+    "openai": "openrouter/openai/gpt-4o",
 }
 
 _FALLBACK_ORDER = ("deepseek", "anthropic", "openai")
@@ -95,6 +102,25 @@ def _provider_of(model: str) -> str:
     return name.lower()
 
 
+def _is_openrouter(model: str) -> bool:
+    """Whether the model id is routed through OpenRouter (``openrouter/...``)."""
+    return _provider_of(model) == "openrouter"
+
+
+def _effective_provider(model: str) -> str:
+    """Resolve the underlying vendor of a litellm-style model id.
+
+    OpenRouter-routed ids (``openrouter/<vendor>/<model>``) map back to the
+    vendor segment (e.g. ``deepseek``, ``anthropic``, ``openai``); plain ids
+    keep their own prefix.
+    """
+    name = model.strip()
+    if _is_openrouter(name):
+        remainder = name.split("/", 1)[1].strip() if "/" in name else ""
+        return _provider_of(remainder) if remainder else "openrouter"
+    return _provider_of(name)
+
+
 def build_fallback_chain(provider_model: str) -> list[str]:
     """Build the fallback chain.
 
@@ -104,7 +130,7 @@ def build_fallback_chain(provider_model: str) -> list[str]:
     requested = provider_model.strip()
     if not requested:
         raise ValueError("provider_model must not be empty")
-    provider = _provider_of(requested)
+    provider = _effective_provider(requested)
     chain = [requested]
     for name in _FALLBACK_ORDER:
         if name == provider:
@@ -141,8 +167,28 @@ def _build_completion_kwargs(
     json_schema: Optional[Type[BaseModel]],
     timeout: float,
 ) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
-    if json_schema is not None and _provider_of(model) in _JSON_RESPONSE_FORMAT_PROVIDERS:
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "timeout": timeout,
+        # Keep the output budget modest so calls fit within the remaining
+        # OpenRouter credit allowance instead of failing with HTTP 402.
+        "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+    }
+    if _is_openrouter(model):
+        # Route through OpenRouter natively with the single shared key so
+        # litellm never looks for provider-specific keys such as
+        # ANTHROPIC_API_KEY or OPENAI_API_KEY.
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if api_key and api_key.strip():
+            kwargs["api_key"] = api_key.strip()
+        else:
+            logger.warning(
+                "[patchcraft.llm] OPENROUTER_API_KEY is not set; falling back "
+                "to litellm's own environment resolution for '%s'.",
+                model,
+            )
+    if json_schema is not None and _effective_provider(model) in _JSON_RESPONSE_FORMAT_PROVIDERS:
         kwargs["response_format"] = {"type": "json_object"}
     return kwargs
 

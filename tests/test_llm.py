@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from unittest import mock
 
 import litellm
@@ -22,28 +23,45 @@ def _completion_response(content: str) -> dict:
 
 
 def test_build_fallback_chain_deepseek_first() -> None:
-    """DeepSeek richiesto -> la chain è DeepSeek, Anthropic, OpenAI."""
-    chain = build_fallback_chain("deepseek/deepseek-chat")
+    """DeepSeek richiesto -> la chain è DeepSeek, Anthropic, OpenAI (OpenRouter)."""
+    chain = build_fallback_chain("openrouter/deepseek/deepseek-chat")
     assert chain == [
-        "deepseek/deepseek-chat",
-        "anthropic/claude-3-7-sonnet-latest",
-        "openai/gpt-4o",
+        "openrouter/deepseek/deepseek-chat",
+        "openrouter/anthropic/claude-3.5-sonnet",
+        "openrouter/openai/gpt-4o",
     ]
 
 
 def test_build_fallback_chain_rotates_requested_provider() -> None:
     """Il modello richiesto viene sempre provato per primo."""
-    chain = build_fallback_chain("anthropic/claude-3-7-sonnet-latest")
-    assert chain[0].startswith("anthropic")
-    assert chain[1].startswith("deepseek")
-    assert chain[2].startswith("openai")
+    chain = build_fallback_chain("openrouter/anthropic/claude-3.5-sonnet")
+    assert chain[0].startswith("openrouter/anthropic")
+    assert chain[1].startswith("openrouter/deepseek")
+    assert chain[2].startswith("openrouter/openai")
 
 
 def test_call_llm_text_output() -> None:
     with mock.patch.object(litellm, "completion", return_value=_completion_response("hello")) as mocked:
-        result = call_llm("deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1)
+        result = call_llm("openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1)
     assert result == "hello"
-    assert mocked.call_args.kwargs["model"] == "deepseek/deepseek-chat"
+    assert mocked.call_args.kwargs["model"] == "openrouter/deepseek/deepseek-chat"
+
+
+def test_call_llm_sends_capped_max_tokens() -> None:
+    """max_tokens è limitato (3000) per evitare errori 402 di OpenRouter."""
+    with mock.patch.object(litellm, "completion", return_value=_completion_response("hello")) as mocked:
+        call_llm("openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1)
+    assert mocked.call_args.kwargs["max_tokens"] == 3000
+
+
+def test_call_llm_uses_openrouter_api_key() -> None:
+    """I modelli openrouter/ ricevono OPENROUTER_API_KEY, non chiavi per-provider."""
+    with (
+        mock.patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test"}, clear=True),
+        mock.patch.object(litellm, "completion", return_value=_completion_response("hello")) as mocked,
+    ):
+        call_llm("openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1)
+    assert mocked.call_args.kwargs["api_key"] == "sk-or-test"
 
 
 def test_call_llm_fallback_after_rate_limit() -> None:
@@ -52,22 +70,22 @@ def test_call_llm_fallback_after_rate_limit() -> None:
 
     def fake_completion(**kwargs):
         seen.append(kwargs["model"])
-        if kwargs["model"].startswith("deepseek"):
+        if "deepseek" in kwargs["model"]:
             raise RateLimitError("rate limited", llm_provider="deepseek", model=kwargs["model"])
         return _completion_response("recovered")
 
     with mock.patch.object(litellm, "completion", side_effect=fake_completion):
         result = call_llm(
-            "deepseek/deepseek-chat", "sys", "user", max_retries_per_model=2, backoff_base=0
+            "openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=2, backoff_base=0
         )
 
     assert result == "recovered"
     # Il rate limit è transiente: DeepSeek viene riprovato per i 2 tentativi
     # previsti, e solo dopo scatta il fallback automatico su Anthropic.
     assert seen == [
-        "deepseek/deepseek-chat",
-        "deepseek/deepseek-chat",
-        "anthropic/claude-3-7-sonnet-latest",
+        "openrouter/deepseek/deepseek-chat",
+        "openrouter/deepseek/deepseek-chat",
+        "openrouter/anthropic/claude-3.5-sonnet",
     ]
 
 
@@ -77,17 +95,17 @@ def test_call_llm_fallback_after_rate_limit_single_try() -> None:
 
     def fake_completion(**kwargs):
         seen.append(kwargs["model"])
-        if kwargs["model"].startswith("deepseek"):
+        if "deepseek" in kwargs["model"]:
             raise RateLimitError("rate limited", llm_provider="deepseek", model=kwargs["model"])
         return _completion_response("recovered")
 
     with mock.patch.object(litellm, "completion", side_effect=fake_completion):
         result = call_llm(
-            "deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1, backoff_base=0
+            "openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1, backoff_base=0
         )
 
     assert result == "recovered"
-    assert seen == ["deepseek/deepseek-chat", "anthropic/claude-3-7-sonnet-latest"]
+    assert seen == ["openrouter/deepseek/deepseek-chat", "openrouter/anthropic/claude-3.5-sonnet"]
 
 
 def test_call_llm_skips_retries_on_auth_error() -> None:
@@ -96,24 +114,24 @@ def test_call_llm_skips_retries_on_auth_error() -> None:
 
     def fake_completion(**kwargs):
         seen.append(kwargs["model"])
-        if kwargs["model"].startswith("deepseek"):
+        if "deepseek" in kwargs["model"]:
             raise AuthenticationError("invalid key", llm_provider="deepseek", model=kwargs["model"])
         return _completion_response("ok")
 
     with mock.patch.object(litellm, "completion", side_effect=fake_completion):
         result = call_llm(
-            "deepseek/deepseek-chat", "sys", "user", max_retries_per_model=3, backoff_base=0
+            "openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=3, backoff_base=0
         )
 
     assert result == "ok"
-    assert seen == ["deepseek/deepseek-chat", "anthropic/claude-3-7-sonnet-latest"]
+    assert seen == ["openrouter/deepseek/deepseek-chat", "openrouter/anthropic/claude-3.5-sonnet"]
 
 
 def test_call_llm_structured_output() -> None:
     """json_schema Pydantic -> la funzione restituisce un'istanza validata."""
     payload = json.dumps({"title": "Alien", "year": 1979})
     with mock.patch.object(litellm, "completion", return_value=_completion_response(payload)) as mocked:
-        result = call_llm("deepseek/deepseek-chat", "sys", "user", Movie, max_retries_per_model=1)
+        result = call_llm("openrouter/deepseek/deepseek-chat", "sys", "user", Movie, max_retries_per_model=1)
 
     assert isinstance(result, Movie)
     assert result.title == "Alien"
@@ -126,7 +144,7 @@ def test_call_llm_no_response_format_for_anthropic() -> None:
     """Anthropic non riceve response_format (JSON estratto e validato a valle)."""
     payload = json.dumps({"title": "Dune", "year": 1984})
     with mock.patch.object(litellm, "completion", return_value=_completion_response(payload)) as mocked:
-        result = call_llm("anthropic/claude-3-7-sonnet-latest", "sys", "user", Movie, max_retries_per_model=1)
+        result = call_llm("openrouter/anthropic/claude-3.5-sonnet", "sys", "user", Movie, max_retries_per_model=1)
     assert isinstance(result, Movie)
     assert "response_format" not in mocked.call_args.kwargs
 
@@ -135,13 +153,13 @@ def test_call_llm_malformed_json_falls_back() -> None:
     """JSON malformato su DeepSeek -> fallback sul provider successivo."""
 
     def fake_completion(**kwargs):
-        if kwargs["model"].startswith("deepseek"):
+        if "deepseek" in kwargs["model"]:
             return _completion_response("scusa, niente JSON")
         return _completion_response(json.dumps({"title": "Dune", "year": 1984}))
 
     with mock.patch.object(litellm, "completion", side_effect=fake_completion):
         result = call_llm(
-            "deepseek/deepseek-chat", "sys", "user", Movie, max_retries_per_model=1, backoff_base=0
+            "openrouter/deepseek/deepseek-chat", "sys", "user", Movie, max_retries_per_model=1, backoff_base=0
         )
 
     assert isinstance(result, Movie)
@@ -157,7 +175,7 @@ def test_call_llm_all_providers_fail_raises() -> None:
     with mock.patch.object(litellm, "completion", side_effect=fake_completion):
         with pytest.raises(MaxRetriesExceeded):
             call_llm(
-                "deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1, backoff_base=0
+                "openrouter/deepseek/deepseek-chat", "sys", "user", max_retries_per_model=1, backoff_base=0
             )
 
 
@@ -165,7 +183,7 @@ def test_call_llm_structured_prompt_contains_schema() -> None:
     """Con json_schema il prompt contiene lo schema JSON da rispettare."""
     payload = json.dumps({"title": "Alien", "year": 1979})
     with mock.patch.object(litellm, "completion", return_value=_completion_response(payload)) as mocked:
-        call_llm("deepseek/deepseek-chat", "sys", "user question", Movie, max_retries_per_model=1)
+        call_llm("openrouter/deepseek/deepseek-chat", "sys", "user question", Movie, max_retries_per_model=1)
     user_msg = mocked.call_args.kwargs["messages"][1]["content"]
     assert "JSON Schema" in user_msg
     assert '"title"' in user_msg

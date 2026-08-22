@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from src.core.llm import call_llm
 
-DEFAULT_MODEL = "deepseek/deepseek-chat"
+DEFAULT_MODEL = "openrouter/deepseek/deepseek-chat"
 
 
 class Diagnosis(BaseModel):
