@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterator, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -43,7 +43,9 @@ __all__ = [
 # ---------------------------------------------------------------------------
 INDEX_DIR_NAME = ".patchcraft"
 INDEX_FILE_NAME = "index.json"
-INDEX_VERSION = 1
+
+# v2: FileEntry gained the `imports` field (import graph for retrieval).
+INDEX_VERSION = 2
 
 #: Directories never indexed (superset of the orchestrator's ignore rules).
 IGNORED_DIR_NAMES = {
@@ -85,6 +87,13 @@ class FileEntry(BaseModel):
     path: str = Field(description="Path relative to the repo root (POSIX separators).")
     hash: str = Field(description="SHA-256 of the file content (hex).")
     symbols: list[SymbolEntry] = Field(default_factory=list)
+    imports: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Repo-relative paths this file imports (Python only; resolved "
+            "against the indexed file set). Powers the retrieval import graph."
+        ),
+    )
 
 
 class SymbolHit(BaseModel):
@@ -148,14 +157,16 @@ def _symbol_from_class(node: ast.ClassDef) -> SymbolEntry:
     )
 
 
-def extract_python(source: str) -> list[SymbolEntry]:
-    """Extract symbols from Python source via :mod:`ast` (never executes it)."""
-    symbols: list[SymbolEntry] = []
+def _parse_python(source: str) -> Optional[ast.Module]:
     try:
-        tree = ast.parse(source)
+        return ast.parse(source)
     except SyntaxError as exc:
         logger.debug("SyntaxError while indexing Python source: %s", exc)
-        return symbols
+        return None
+
+
+def _symbols_from_tree(tree: ast.Module) -> list[SymbolEntry]:
+    symbols: list[SymbolEntry] = []
 
     def walk(body: list[ast.stmt], class_depth: int = 0) -> None:
         for node in body:
@@ -168,6 +179,31 @@ def extract_python(source: str) -> list[SymbolEntry]:
 
     walk(tree.body)
     return symbols
+
+
+def _imports_from_tree(tree: ast.Module) -> list[tuple[int, str]]:
+    """Collect ``(level, module)`` pairs from every Import/ImportFrom node."""
+    collected: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                collected.append((0, alias.name))
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or (node.names[0].name if node.names else "")
+            if module:
+                collected.append((node.level or 0, module))
+            elif node.level:
+                # `from . import x` — only the relative package is known.
+                collected.append((node.level or 0, ""))
+    return collected
+
+
+def extract_python(source: str) -> list[SymbolEntry]:
+    """Extract symbols from Python source via :mod:`ast` (never executes it)."""
+    tree = _parse_python(source)
+    if tree is None:
+        return []
+    return _symbols_from_tree(tree)
 
 
 # ---------------------------------------------------------------------------
@@ -292,32 +328,55 @@ class RepoIndex:
         return hashlib.sha256(data).hexdigest()
 
     @classmethod
-    def _extract_file(cls, path: Path) -> list[SymbolEntry]:
+    def _analyze_file(cls, path: Path) -> tuple[list[SymbolEntry], list[tuple[int, str]]]:
+        """Extract ``(symbols, raw_imports)`` from one source file."""
         suffix = path.suffix.lower()
-        if suffix in PYTHON_EXTENSIONS:
-            extractor: Callable[[str], list[SymbolEntry]] = extract_python
-        elif suffix in JS_EXTENSIONS:
-            extractor = extract_js
-        else:
-            return []
+        if suffix not in PYTHON_EXTENSIONS and suffix not in JS_EXTENSIONS:
+            return [], []
         try:
             data = path.read_bytes()
         except OSError as exc:
             logger.debug("Cannot read %s: %s", path, exc)
-            return []
+            return [], []
         source = data.decode("utf-8", errors="replace")
         try:
-            return extractor(source)
+            if suffix in PYTHON_EXTENSIONS:
+                tree = _parse_python(source)
+                if tree is None:
+                    return [], []
+                return _symbols_from_tree(tree), _imports_from_tree(tree)
+            return extract_js(source), []  # JS/TS import graph: not supported yet
         except Exception as exc:  # noqa: BLE001 - indexing must never break a run
             logger.debug("Extraction failed for %s: %s: %s", path, type(exc).__name__, exc)
+            return [], []
+
+    @staticmethod
+    def _candidate_import_targets(
+        level: int, module: str, rel_path: str
+    ) -> list[str]:
+        """Possible repo-relative file paths for one import statement."""
+        parent_parts = list(PurePosixPath(rel_path).parts[:-1])
+        if level > 0:
+            keep = len(parent_parts) - (level - 1)
+            if keep < 0:
+                return []
+            base = parent_parts[:keep]
+        else:
+            base = []
+        mod_parts = module.split(".") if module else []
+        joined = "/".join([*base, *mod_parts])
+        if not joined:
             return []
+        return [f"{joined}.py", f"{joined}/__init__.py"]
 
     @classmethod
     def build(cls, repo_root: Union[str, Path], force: bool = False) -> "RepoIndex":
         """Build (or incrementally refresh) the index of ``repo_root``.
 
-        Unchanged files (same content hash) reuse their cached symbols, so a
-        warm rebuild only re-parses what actually changed.
+        Unchanged files (same content hash) reuse their cached symbols and
+        imports, so a warm rebuild only re-parses what actually changed.
+        Import statements are resolved to repo-relative file paths in a
+        second pass, once the full file set is known.
         """
         root = Path(repo_root).expanduser().resolve()
         if not root.is_dir():
@@ -328,6 +387,7 @@ class RepoIndex:
             cached, _ = cls.load_cached(root)
 
         files: dict[str, FileEntry] = {}
+        pending_imports: dict[str, list[tuple[int, str]]] = {}
         for path in cls._iter_source_files(root):
             suffix = path.suffix.lower()
             if suffix not in PYTHON_EXTENSIONS and suffix not in JS_EXTENSIONS:
@@ -342,7 +402,22 @@ class RepoIndex:
             if cached_entry is not None and cached_entry.hash == digest:
                 files[rel] = cached_entry
                 continue
-            files[rel] = FileEntry(path=rel, hash=digest, symbols=cls._extract_file(path))
+            symbols, raw_imports = cls._analyze_file(path)
+            files[rel] = FileEntry(path=rel, hash=digest, symbols=symbols)
+            if raw_imports:
+                pending_imports[rel] = raw_imports
+
+        # Resolve import statements against the complete indexed file set.
+        known = set(files)
+        for rel, raw_imports in pending_imports.items():
+            resolved: set[str] = set()
+            for level, module in raw_imports:
+                for target in cls._candidate_import_targets(level, module, rel):
+                    if target in known and target != rel:
+                        resolved.add(target)
+                        break
+            if resolved:
+                files[rel] = files[rel].model_copy(update={"imports": sorted(resolved)})
 
         index = cls(root, files)
         index.save()

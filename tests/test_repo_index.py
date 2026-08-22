@@ -155,10 +155,14 @@ class TestBuild:
         target = repo / "src" / "myapp" / "module_00.py"
         target.write_text("def brand_new_function():\n    pass\n", encoding="utf-8")
 
-        with mock.patch.object(ri, "extract_python", side_effect=ri.extract_python) as spy:
+        with mock.patch.object(
+            ri.RepoIndex, "_analyze_file", autospec=True, side_effect=ri.RepoIndex._analyze_file
+        ) as spy:
             refreshed = RepoIndex.build(repo)
 
-        assert spy.call_count == 1  # exactly the changed file was re-parsed
+        assert spy.call_count == 1  # exactly the changed file was re-analyzed
+        analyzed_path = spy.call_args.args[-1]
+        assert analyzed_path.name == "module_00.py"
         names = {s.name for s in refreshed.files["src/myapp/module_00.py"].symbols}
         assert "brand_new_function" in names
 

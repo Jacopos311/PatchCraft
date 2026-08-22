@@ -177,11 +177,12 @@ def build_context(repo_root: Path, issue_description: str) -> str:
 
     # Structural overview first (Roadmap Step 1.1): a compact symbol map of
     # the whole repository, built incrementally and cached on disk.
+    repo_index_obj = None
     try:
         from src.core.repo_index import RepoIndex
 
-        index = RepoIndex.build(repo_root)
-        repo_map_text = index.repo_map()
+        repo_index_obj = RepoIndex.build(repo_root)
+        repo_map_text = repo_index_obj.repo_map()
         if repo_map_text:
             sections.append(f"# REPOSITORY MAP\n{repo_map_text}")
     except Exception as exc:  # noqa: BLE001 - indexing must never break context building
@@ -207,14 +208,40 @@ def build_context(repo_root: Path, issue_description: str) -> str:
             sections.append(f"# FILE: {doc.relative_to(repo_root)}\n```\n{content}\n```")
 
     sources = _discover_source_files(repo_root)
+
+    # Retrieval-first ordering (Roadmap Step 1.2): the top-k files for THIS
+    # issue are always included ahead of the alphabetical remainder, so the
+    # MAX_SOURCE_FILES cap can no longer drop the files that matter.
+    retrieved: list[Path] = []
+    try:
+        from src.core.retrieval import DEFAULT_RETRIEVAL_K, select_files
+
+        if repo_index_obj is not None and sources:
+            try:
+                k = int(os.getenv("PATCHCRAFT_RETRIEVAL_K", str(DEFAULT_RETRIEVAL_K)))
+            except ValueError:
+                k = DEFAULT_RETRIEVAL_K
+            retrieved = [
+                repo_root / rel
+                for rel in select_files(issue_description, repo_index_obj, k=k)
+                if (repo_root / rel).is_file()
+            ]
+    except Exception as exc:  # noqa: BLE001 - retrieval must never break context building
+        logger.debug("Retrieval skipped (%s: %s).", type(exc).__name__, exc)
+
+    resolved_retrieved = {p.resolve() for p in retrieved}
+    rest = [p for p in sources if p.resolve() not in resolved_retrieved]
+    ordered_sources = [*retrieved, *rest[:MAX_SOURCE_FILES]]
+
     total = sum(len(s) if isinstance(s, str) else 0 for s in sections)
-    for source in sources:
+    for source in ordered_sources:
         content = _read_text_limited(source)
         header_len = len(f"\n# FILE: {source.relative_to(repo_root)}\n```\n```\n")
         if total + len(content) + header_len > MAX_CONTEXT_CHARS:
             break
+        marker = " [RETRIEVED: relevant to this issue]" if source in retrieved else ""
         sections.append(
-            f"\n# FILE: {source.relative_to(repo_root)}\n```\n{content}\n```\n"
+            f"\n# FILE: {source.relative_to(repo_root)}{marker}\n```\n{content}\n```\n"
         )
         total += len(content) + header_len
 
@@ -226,9 +253,17 @@ def build_coder_context(repo_root: Path, affected_files: Sequence[str]) -> str:
 
     The coder agent needs the real source code to produce patches that match
     the files on disk (without it, patches are invented and tests always
-    fail, triggering the final rollback). Paths are resolved safely inside
-    the repo root and the overall size is capped like ``build_context``.
+    fail, triggering the final rollback). Paths are validated and
+    fuzzy-matched against the repository index (Step 1.2) before use, and
+    the overall size is capped like ``build_context``.
     """
+    try:
+        from src.core.retrieval import resolve_affected_files
+
+        affected_files = resolve_affected_files(repo_root, list(affected_files))
+    except Exception as exc:  # noqa: BLE001 - resolution must never break context building
+        logger.debug("Affected-path resolution skipped (%s: %s).", type(exc).__name__, exc)
+
     sections: list[str] = []
     total = 0
     seen: set[Path] = set()
