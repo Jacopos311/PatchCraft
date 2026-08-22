@@ -13,6 +13,9 @@ venv/
 .coverage
 htmlcov/
 
+# PatchCraft index cache (generated per-repo by the context engine)
+.patchcraft/
+
 # Env chiavi API (mai committare i secret)
 .env
 .env.*

@@ -172,8 +172,20 @@ def _discover_source_files(repo_root: Path) -> list[Path]:
 
 
 def build_context(repo_root: Path, issue_description: str) -> str:
-    """Compose the context for the model: docs + sources + issue description."""
+    """Compose the context for the model: issue + repo map + docs + sources."""
     sections: list[str] = [f"# ISSUE TO SOLVE\n{issue_description.strip()}"]
+
+    # Structural overview first (Roadmap Step 1.1): a compact symbol map of
+    # the whole repository, built incrementally and cached on disk.
+    try:
+        from src.core.repo_index import RepoIndex
+
+        index = RepoIndex.build(repo_root)
+        repo_map_text = index.repo_map()
+        if repo_map_text:
+            sections.append(f"# REPOSITORY MAP\n{repo_map_text}")
+    except Exception as exc:  # noqa: BLE001 - indexing must never break context building
+        logger.debug("Repo index unavailable (%s: %s); continuing without map.", type(exc).__name__, exc)
 
     docs: list[Path] = []
     for name in ("architecture.md", "README.md"):
