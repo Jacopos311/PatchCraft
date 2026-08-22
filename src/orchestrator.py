@@ -20,17 +20,18 @@ Progress is shown on screen with the ``rich`` library; an optional
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import os
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
-from src.agents.coder import Patch, correct_patch, generate_patch
+from src.agents.coder import Patch, correct_patch, dynamic_patch_budget, generate_patch
 from src.agents.diagnostic import diagnose
 from src.agents.reporter import PatchReport, generate_report
 from src.sandbox.runner import SandboxRunner
@@ -136,6 +137,36 @@ def build_context(repo_root: Path, issue_description: str) -> str:
         total += len(content) + header_len
 
     return "\n".join(sections)
+
+
+def build_coder_context(repo_root: Path, affected_files: Sequence[str]) -> str:
+    """Collect the ACTUAL contents of the diagnosed affected files.
+
+    The coder agent needs the real source code to produce patches that match
+    the files on disk (without it, patches are invented and tests always
+    fail, triggering the final rollback). Paths are resolved safely inside
+    the repo root and the overall size is capped like ``build_context``.
+    """
+    sections: list[str] = []
+    total = 0
+    seen: set[Path] = set()
+    for rel in affected_files:
+        if not rel or not rel.strip():
+            continue
+        target = _resolve_patch_path(rel.strip(), repo_root)
+        if target is None or not target.is_file() or target in seen:
+            continue
+        seen.add(target)
+        content = _read_text_limited(target)
+        if not content:
+            continue
+        header = f"\n# FILE: {target.relative_to(repo_root).as_posix()}\n```\n```\n"
+        if total + len(content) + len(header) > MAX_CONTEXT_CHARS:
+            console.print(f"[yellow]⚠ Coder context budget reached, skipping: {rel}[/]")
+            break
+        sections.append(f"# FILE: {target.relative_to(repo_root).as_posix()}\n```\n{content}\n```")
+        total += len(content) + len(header)
+    return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -298,25 +329,47 @@ def run_patchcraft_loop(
     test_errors: list[str] = []
     files_changed: list[str] = []
 
+    # Ground the coder in the real source code: without it every patch is
+    # invented, tests always fail and the final rollback erases all changes.
+    with console.status("📚 Collecting affected files for the coder ..."):
+        coder_context = build_coder_context(repo_root, diagnosis.affected_files)
+    if coder_context:
+        console.print(f"[green]✓[/] Coder context ready ({len(coder_context)} chars).")
+    else:
+        console.print("[yellow]⚠ No affected files found on disk; coder will rely on the diagnosis only.[/]")
+    patch_budget = dynamic_patch_budget(max(1, len(diagnosis.affected_files)))
+
     for attempt in range(1, max_retries + 1):
         console.rule(f"[bold cyan] Iteration {attempt}/{max_retries} [/]")
         emit("iteration", f"Iteration {attempt}/{max_retries}")
 
         with console.status("✍️  Generating patch ..."):
             if attempt == 1:
-                candidate = generate_patch(diagnosis.model_dump_json(indent=2), model)
+                candidate = generate_patch(
+                    diagnosis.model_dump_json(indent=2),
+                    model,
+                    repo_context=coder_context,
+                    max_tokens=patch_budget,
+                )
             else:
                 candidate = correct_patch(
                     previous_patch=current_patch,
                     test_feedback="\n---\n".join(test_errors),
                     provider_model=model,
+                    repo_context=coder_context,
+                    max_tokens=patch_budget,
                 )
                 emit("patch", "Self-correcting patch generated.")
         current_patch = _coerce_patch(candidate)
         if current_patch is None or not current_patch.files:
             console.print("[red]✗ No files in the patch: iteration skipped.[/]")
-            test_errors.append("The generated patch contained no modifiable files.")
-            emit("error", "The generated patch contained no modifiable files.")
+            test_errors.append(
+                "The generated patch was missing, not valid JSON or contained no "
+                "files. IMPORTANT: respond with a single JSON object like "
+                '{"files": [{"file_path": "rel/path.py", "new_content": "COMPLETE file content"}]} '
+                "and make sure the output is NOT truncated."
+            )
+            emit("error", "The generated patch was invalid or contained no modifiable files.")
             continue
 
         new_snapshots = apply_patch(current_patch, repo_root)
@@ -403,17 +456,57 @@ def run_patchcraft_loop(
 
 
 def _coerce_patch(candidate: object) -> Optional[Patch]:
-    """Convert agent output (Patch | str) into :class:`Patch`."""
+    """Convert agent output (Patch | str) into :class:`Patch`.
+
+    Smart-guardrails for raw string output:
+    * markdown code fences (```json ... ```) are stripped;
+    * a JSON object embedded in surrounding prose is extracted;
+    * truncated JSON is reported explicitly so the self-correction loop can
+      react instead of silently skipping the iteration.
+    """
     if isinstance(candidate, Patch):
         return candidate
     if isinstance(candidate, BaseModel):
         return Patch.model_validate(candidate.model_dump())
     if isinstance(candidate, str):
-        try:
-            return Patch.model_validate_json(candidate)
-        except ValidationError as exc:
-            console.print(f"[red]✗ Invalid patch JSON: {exc}[/]")
-            return None
+        text = candidate.strip()
+        # 1) direct parse
+        attempts = [text]
+        # 2) strip markdown fences
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            while lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            attempts.append("\n".join(lines).strip())
+        # 3) extract outermost JSON object from surrounding prose
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            attempts.append(text[start:end + 1])
+
+        for attempt_text in attempts:
+            if not attempt_text:
+                continue
+            try:
+                data = json.loads(attempt_text)
+            except json.JSONDecodeError:
+                continue
+            try:
+                return Patch.model_validate(data)
+            except ValidationError as exc:
+                console.print(f"[red]✗ Patch JSON does not match the schema: {exc}[/]")
+                return None
+
+        truncated = "```" in text or text.rstrip().endswith(('"', ",", "}", "]")) is False
+        hint = (
+            " The output looks TRUNCATED: raise the max_tokens budget."
+            if len(text) >= 4000 or truncated
+            else ""
+        )
+        console.print(f"[red]✗ Invalid patch JSON (no parsable object found).{hint}[/]")
+        return None
     return None
 
 
@@ -421,6 +514,7 @@ __all__ = [
     "run_patchcraft_loop",
     "RunResult",
     "build_context",
+    "build_coder_context",
     "apply_patch",
     "compute_diff",
     "rollback",

@@ -8,7 +8,9 @@ from src.agents.coder import Patch
 from src.agents.diagnostic import Diagnosis
 from src.agents.reporter import PatchReport
 from src.orchestrator import (
+    _coerce_patch,
     apply_patch,
+    build_coder_context,
     build_context,
     compute_diff,
     rollback,
@@ -224,3 +226,61 @@ class TestRunPatchcraftLoop:
 
         with pytest.raises(NotADirectoryError):
             run_patchcraft_loop(str(tmp_path / "nope"), "bug", "mock")
+
+
+class TestSmartGuardrails:
+    """Guardrail: il patch JSON deve arrivare al disco anche se 'sporco'."""
+
+    def test_coerce_patch_strips_markdown_fences(self) -> None:
+        raw = '```json\n{"files": [{"file_path": "a.py", "new_content": "x=1\\n"}]}\n```'
+        patch = _coerce_patch(raw)
+        assert patch is not None
+        assert patch.files[0].file_path == "a.py"
+
+    def test_coerce_patch_extracts_json_from_prose(self) -> None:
+        raw = (
+            "Here is the patch you requested:\n"
+            '{"files": [{"file_path": "a.py", "new_content": "x=1\\n"}]}\n'
+            "Let me know if anything else is needed."
+        )
+        patch = _coerce_patch(raw)
+        assert patch is not None
+        assert patch.files[0].file_path == "a.py"
+
+    def test_coerce_patch_garbage_returns_none(self) -> None:
+        assert _coerce_patch("scusa, non ho capito") is None
+        assert _coerce_patch(None) is None
+        assert _coerce_patch('{"files": [{"file_path": 42}]}') is None
+
+    def test_build_coder_context_reads_affected_files(self, tmp_path) -> None:
+        """Il contesto del coder contiene i file reali, ignorando path fuori repo."""
+        _write(tmp_path, "src/app.py", "def add(a, b):\n    return a + b\n")
+        context = build_coder_context(tmp_path, ["src/app.py", "../secret.py", "missing.py", ""])
+        assert "def add" in context
+        assert "src/app.py" in context
+        # niente traversal o file inesistenti
+        assert "secret" not in context
+
+    def test_loop_passes_real_file_contents_to_coder(self, tmp_path) -> None:
+        """Integrazione: generate_patch riceve il contenuto REALE dei file."""
+        _write(tmp_path, "src/app.py", "def add(a, b):\n    return a - b\n")
+        ok = TestResult(success=True, exit_code=0)
+        captured: dict = {}
+
+        def _generate(diagnosis: str, model: str, **kwargs):
+            captured.update(kwargs)
+            return _patch_for("src/app.py", "def add(a, b):\n    return a + b\n")
+
+        with (
+            mock.patch("src.orchestrator.diagnose", return_value=_diagnosis()),
+            mock.patch("src.orchestrator.generate_patch", side_effect=_generate),
+            mock.patch("src.orchestrator.SandboxRunner.run_tests", return_value=ok),
+            mock.patch("src.orchestrator.generate_report", return_value=_report()),
+        ):
+            result = run_patchcraft_loop(str(tmp_path), "Fix the offset", model="mock")
+
+        assert result.success is True
+        assert "return a - b" in captured["repo_context"], (
+            "il coder deve vedere il contenuto attuale del file"
+        )
+        assert captured["max_tokens"] >= 6000, "budget dinamico per patch complete"

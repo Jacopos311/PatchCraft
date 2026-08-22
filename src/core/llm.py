@@ -166,14 +166,17 @@ def _build_completion_kwargs(
     messages: list[dict[str, str]],
     json_schema: Optional[Type[BaseModel]],
     timeout: float,
+    max_tokens: Optional[int] = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "timeout": timeout,
-        # Keep the output budget modest so calls fit within the remaining
-        # OpenRouter credit allowance instead of failing with HTTP 402.
-        "max_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+        # Keep the default output budget modest so calls fit within the
+        # remaining OpenRouter credit allowance instead of failing with
+        # HTTP 402. Callers can raise it for large completions (e.g. the
+        # coder agent emitting complete file contents).
+        "max_tokens": max_tokens if max_tokens and max_tokens > 0 else DEFAULT_MAX_OUTPUT_TOKENS,
     }
     if _is_openrouter(model):
         # Route through OpenRouter natively with the single shared key so
@@ -251,6 +254,7 @@ def call_llm(
     max_retries_per_model: int = DEFAULT_MAX_RETRIES_PER_MODEL,
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
+    max_tokens: Optional[int] = None,
 ) -> str: ...
 
 
@@ -265,6 +269,7 @@ def call_llm(
     max_retries_per_model: int = DEFAULT_MAX_RETRIES_PER_MODEL,
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
+    max_tokens: Optional[int] = None,
 ) -> BaseModel: ...
 
 
@@ -278,6 +283,7 @@ def call_llm(
     max_retries_per_model: int = DEFAULT_MAX_RETRIES_PER_MODEL,
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
+    max_tokens: Optional[int] = None,
 ) -> Union[str, BaseModel]:
     """Query the LLM with automatic cross-model fallback.
 
@@ -299,6 +305,10 @@ def call_llm(
         Base of the exponential wait on transient errors (e.g. rate limits).
     fallback_chain : Sequence[str] | None
         Overrides the automatic chain (default DeepSeek -> Anthropic -> OpenAI).
+    max_tokens : int | None
+        Maximum completion output tokens. ``None`` uses the conservative
+        default (:data:`DEFAULT_MAX_OUTPUT_TOKENS`); raise it for calls that
+        must emit large payloads (e.g. complete-file patches).
 
     Returns
     -------
@@ -315,7 +325,7 @@ def call_llm(
 
     last_error: Optional[BaseException] = None
     for model in chain:
-        completion_kwargs = _build_completion_kwargs(model, messages, json_schema, timeout)
+        completion_kwargs = _build_completion_kwargs(model, messages, json_schema, timeout, max_tokens)
         for attempt in range(1, max_retries_per_model + 1):
             try:
                 response = litellm.completion(**completion_kwargs)
