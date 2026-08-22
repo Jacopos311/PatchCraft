@@ -1,0 +1,1 @@
+"""Core: accesso LLM con fallback automatico e utility condivise."""

@@ -1,0 +1,1 @@
+"""PatchCraft AI agents: diagnostic, coder, reporter."""

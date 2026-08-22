@@ -1,0 +1,1 @@
+"""PatchCraft — main package (agents, sandbox, orchestrator, core)."""

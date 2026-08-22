@@ -1,0 +1,1 @@
+"""Test del sistema PatchCraft."""

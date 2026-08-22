@@ -1,0 +1,1 @@
+"""PatchCraft configuration (API keys and LLM models)."""
