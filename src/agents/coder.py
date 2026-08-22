@@ -11,7 +11,7 @@ chat default (which would truncate the JSON and silently discard the patch).
 from __future__ import annotations
 
 import json
-from typing import Optional, Type, Union
+from typing import Callable, Optional, Type, Union
 
 from pydantic import BaseModel, Field
 
@@ -49,12 +49,14 @@ class Patch(BaseModel):
 BASE_PATCH_MAX_TOKENS = 6000       # covers a single focused file rewrite
 PER_FILE_EXTRA_TOKENS = 2500       # extra head-room for each additional file
 MAX_PATCH_MAX_TOKENS = 16000       # never exceed common model output limits
+MIN_FILE_EXTRA_BUDGET = 2000       # minimum extra budget per correction iteration
 
 
-def dynamic_patch_budget(num_files: int) -> int:
+def dynamic_patch_budget(num_files: int, correction_iteration: int = 0) -> int:
     """Output-token budget for a patch involving ``num_files`` files."""
     files = max(1, num_files)
-    return min(MAX_PATCH_MAX_TOKENS, BASE_PATCH_MAX_TOKENS + PER_FILE_EXTRA_TOKENS * (files - 1))
+    base = BASE_PATCH_MAX_TOKENS + (MIN_FILE_EXTRA_BUDGET * correction_iteration)
+    return min(MAX_PATCH_MAX_TOKENS, base + PER_FILE_EXTRA_TOKENS * (files - 1))
 
 
 SYSTEM_PROMPT = (
@@ -109,6 +111,7 @@ def generate_patch(
     *,
     repo_context: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> Union[str, BaseModel]:
     """Generate a :class:`Patch` (complete file contents) from a diagnosis.
 
@@ -126,6 +129,9 @@ def generate_patch(
     max_tokens : int | None
         Completion budget; when ``None`` it is derived from the number of
         files mentioned in the diagnosis.
+    usage_sink : Callable[[int, int], None] | None
+        Optional ``(prompt_tokens, completion_tokens)`` callback for
+        per-task token accounting.
     """
     if max_tokens is None:
         max_tokens = dynamic_patch_budget(_files_in_payload(diagnosis, "affected_files"))
@@ -135,6 +141,7 @@ def generate_patch(
         user_prompt=_append_context(str(diagnosis), repo_context),
         json_schema=json_schema or Patch,
         max_tokens=max_tokens,
+        usage_sink=usage_sink,
     )
 
 
@@ -146,6 +153,8 @@ def correct_patch(
     *,
     repo_context: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    iteration: int = 0,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> Union[str, BaseModel]:
     """Self-correction: fix the patch using the failed test output.
 
@@ -164,11 +173,16 @@ def correct_patch(
     max_tokens : int | None
         Completion budget; when ``None`` it is derived from the size of the
         previous patch.
+    iteration : int
+        Current correction iteration count (used to increase budget)
+    usage_sink : Callable[[int, int], None] | None
+        Optional ``(prompt_tokens, completion_tokens)`` callback for
+        per-task token accounting.
     """
     if isinstance(previous_patch, Patch):
         previous_patch = previous_patch.model_dump_json(indent=2)
     if max_tokens is None:
-        max_tokens = dynamic_patch_budget(_files_in_payload(previous_patch, "files"))
+        max_tokens = dynamic_patch_budget(_files_in_payload(previous_patch, "files"), iteration)
     user_prompt = (
         f"HERE IS THE PREVIOUS PATCH (already applied to files):\n{previous_patch}\n\n"
         f"Here is the TEST FAILURE output:\n{test_feedback}\n\n"
@@ -180,4 +194,5 @@ def correct_patch(
         user_prompt=_append_context(user_prompt, repo_context),
         json_schema=json_schema or Patch,
         max_tokens=max_tokens,
+        usage_sink=usage_sink,
     )

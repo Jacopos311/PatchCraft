@@ -49,9 +49,26 @@ def ask(obj: dict, prompt: str, system: str) -> None:
 @cli.command("run")
 @click.argument("repo_path")
 @click.argument("issue")
-@click.option("--max-retries", "max_retries", default=3, show_default=True)
+@click.option("--max-retries", "max_retries", default=-1, show_default=True,
+              help="Hard cap on patch+test iterations. -1 = run until tests "
+                   "pass (loop detection and budgets still apply).")
+@click.option("--token-budget", default=None, type=int,
+              help="Max total LLM tokens per task (env PATCHCRAFT_TOKEN_BUDGET).")
+@click.option("--time-budget", "time_budget", default=None, type=float,
+              help="Wall-clock budget in seconds per task (env PATCHCRAFT_TIME_BUDGET).")
+@click.option("--min-credits", "min_credits", default=None, type=float,
+              help="Halt if OpenRouter remaining credits drop below this value "
+                   "(env PATCHCRAFT_MIN_CREDITS).")
 @click.pass_obj
-def run(obj: dict, repo_path: str, issue: str, max_retries: int) -> None:
+def run(
+    obj: dict,
+    repo_path: str,
+    issue: str,
+    max_retries: int,
+    token_budget: int | None,
+    time_budget: float | None,
+    min_credits: float | None,
+) -> None:
     """Run the PatchCraft pipeline on REPO_PATH with the given ISSUE.
 
     REPO_PATH is the target project directory; ISSUE is the bug
@@ -65,13 +82,18 @@ def run(obj: dict, repo_path: str, issue: str, max_retries: int) -> None:
             repo_path=repo_path,
             issue_description=issue,
             model=obj["model"],
-            max_retries=max_retries,
+            max_retries=max_retries if max_retries > 0 else None,
+            token_budget=token_budget,
+            time_budget_seconds=time_budget,
+            min_remaining_credits=min_credits,
         )
     except (NotADirectoryError, ValueError) as exc:
         CONSOLE.print(Panel(str(exc), title="[bold red]Configuration error[/]", border_style="red"))
         raise SystemExit(1) from exc
 
     if not result.success:
+        if result.halt_reason:
+            CONSOLE.print(f"[red]Halted:[/] {result.halt_reason}")
         raise SystemExit(1)
 
 
@@ -82,7 +104,16 @@ def run(obj: dict, repo_path: str, issue: str, max_retries: int) -> None:
               help="GitHub label used to filter open issues.")
 @click.option("--limit", default=10, show_default=True,
               help="Maximum number of issues to display (1-100).")
-@click.option("--max-retries", "max_retries", default=3, show_default=True)
+@click.option("--max-retries", "max_retries", default=-1, show_default=True,
+              help="Hard cap on patch+test iterations. -1 = run until tests "
+                   "pass (loop detection and budgets still apply).")
+@click.option("--token-budget", default=None, type=int,
+              help="Max total LLM tokens per task (env PATCHCRAFT_TOKEN_BUDGET).")
+@click.option("--time-budget", "time_budget", default=None, type=float,
+              help="Wall-clock budget in seconds per task (env PATCHCRAFT_TIME_BUDGET).")
+@click.option("--min-credits", "min_credits", default=None, type=float,
+              help="Halt if OpenRouter remaining credits drop below this value "
+                   "(env PATCHCRAFT_MIN_CREDITS).")
 @click.pass_obj
 def select(
     obj: dict,
@@ -91,6 +122,9 @@ def select(
     label: str,
     limit: int,
     max_retries: int,
+    token_budget: int | None,
+    time_budget: float | None,
+    min_credits: float | None,
 ) -> None:
     """Pick a GitHub issue (GITHUB_REPO) and solve it in a local repo.
 
@@ -147,7 +181,10 @@ def select(
             repo_path=local_repo_path,
             issue_description=issue_description,
             model=obj["model"],
-            max_retries=max_retries,
+            max_retries=max_retries if max_retries > 0 else None,
+            token_budget=token_budget,
+            time_budget_seconds=time_budget,
+            min_remaining_credits=min_credits,
         )
     except (NotADirectoryError, ValueError) as exc:
         CONSOLE.print(Panel(str(exc), title="[bold red]Configuration error[/]", border_style="red"))
@@ -155,13 +192,15 @@ def select(
 
 
 @cli.command("gui")
-@click.option("--max-retries", "max_retries", default=3, show_default=True)
+@click.option("--max-retries", "max_retries", default=-1, show_default=True,
+              help="Hard cap on iterations in the GUI pipeline. -1 = run until "
+                   "tests pass (loop detection and budgets still apply).")
 @click.pass_obj
 def gui(obj: dict, max_retries: int) -> None:
     """Launch the PatchCraft interactive TUI (Textual)."""
     from src.gui import launch_gui
 
-    launch_gui(model=obj["model"], max_retries=max_retries)
+    launch_gui(model=obj["model"], max_retries=max_retries if max_retries > 0 else None)
 
 
 if __name__ == "__main__":

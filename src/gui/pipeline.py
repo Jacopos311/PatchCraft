@@ -41,7 +41,7 @@ def run_pipeline(
     repo_path: str,
     issue_description: str,
     model: str,
-    max_retries: int = 3,
+    max_retries: Optional[int] = None,
     on_event: Optional[Callable[[PipelineEvent], None]] = None,
 ) -> Any:
     """Run the PatchCraft pipeline, streaming milestones to ``on_event``.
@@ -50,7 +50,9 @@ def run_pipeline(
     :func:`src.orchestrator.run_patchcraft_loop` designed to be invoked from
     a background thread/worked. ``on_event`` receives a :class:`PipelineEvent`
     for every milestone; exceptions raised by the callback are swallowed by
-    the orchestrator so they can never break the pipeline.
+    the orchestrator so they can never break the pipeline. ``max_retries``
+    follows the orchestrator semantics: ``None`` runs the goal-driven loop
+    until tests pass (loop detection and budgets still apply).
     """
     from src.orchestrator import run_patchcraft_loop
 

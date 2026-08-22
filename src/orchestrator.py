@@ -20,9 +20,12 @@ Progress is shown on screen with the ``rich`` library; an optional
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import logging
 import os
+import re
+import time
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -68,6 +71,73 @@ class RunResult(BaseModel):
     files_changed: list[str] = Field(
         default_factory=list, description="Files actually modified."
     )
+    halt_reason: Optional[str] = Field(
+        default=None,
+        description=(
+            "Human-readable reason the loop stopped without success "
+            "(retry limit, stagnation, token/time budget or credit floor)."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Goal-driven loop guardrails (loop detection + budget/safety limits)
+# ---------------------------------------------------------------------------
+# The self-correction loop runs until tests pass. To guarantee it can never
+# spin forever or burn unbounded tokens, three safety nets are enforced:
+#
+# * STAGNATION: when the SAME failure signature (or an identical patch)
+#   repeats over consecutive iterations, the model first receives an
+#   explicit strategy-change directive; if it keeps producing the same
+#   failing result the loop halts gracefully with a clear report.
+STAGNATION_STRATEGY_AFTER = 2   # consecutive identical failures before a strategy change is forced
+STAGNATION_HALT_AFTER = 5       # consecutive identical failures before the loop halts
+
+
+def _error_signature(test_result: object) -> str:
+    """Stable fingerprint of a test failure used for loop detection.
+
+    Only *volatile* tokens (execution times, memory addresses) are
+    normalized; assertion values and failure names are preserved, because a
+    changed assertion value means the agent is making progress. Only the
+    tail of the output is kept, where test frameworks print their summary.
+    """
+    text = f"{getattr(test_result, 'stdout', '')}\n{getattr(test_result, 'stderr', '')}"
+    text = re.sub(r"\d+(?:\.\d+)?\s*(?:s|sec|seconds|ms)\b", "<t>", text)
+    text = re.sub(r"0x[0-9a-fA-F]+", "<addr>", text)
+    lines = [re.sub(r"\s+", " ", line.strip()) for line in text.splitlines() if line.strip()]
+    blob = "\n".join(lines[-40:])
+    return hashlib.sha1(blob.encode("utf-8", "replace")).hexdigest()
+
+
+def _remaining_credits() -> Optional[float]:
+    """Remaining OpenRouter credits (``limit - usage``), ``None`` if unknown."""
+    try:
+        from src.core.credits import fetch_credits
+
+        data = fetch_credits()
+    except Exception as exc:  # noqa: BLE001 - the credit guard must never break the loop
+        logger.debug("Credit check skipped: %s: %s", type(exc).__name__, exc)
+        return None
+    if not data:
+        return None
+    limit = data.get("limit")
+    usage = data.get("usage")
+    if isinstance(limit, (int, float)) and isinstance(usage, (int, float)):
+        return max(0.0, float(limit) - float(usage))
+    return None
+
+
+def _env_optional(name: str, cast: Callable[[str], object]) -> Optional[object]:
+    """Read an optional numeric environment variable."""
+    raw = os.getenv(name)
+    if not raw or not raw.strip():
+        return None
+    try:
+        return cast(raw)
+    except ValueError:
+        logger.warning("Invalid value for %s: %r — ignored.", name, raw)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -261,10 +331,17 @@ def run_patchcraft_loop(
     repo_path: str,
     issue_description: str,
     model: str,
-    max_retries: int = 3,
+    max_retries: Optional[int] = None,
     event_sink: Optional[Callable[[str, str], None]] = None,
+    token_budget: Optional[int] = None,
+    time_budget_seconds: Optional[float] = None,
+    min_remaining_credits: Optional[float] = None,
 ) -> RunResult:
-    """Run the full Diagnosis -> Patch -> Test -> Self-Correction flow.
+    """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
+
+    The loop is **dynamic**: it keeps iterating (analyze, patch, test) until
+    all tests pass or one of the safety guardrails stops it — there is no
+    arbitrary retry cut-off unless you explicitly set ``max_retries``.
 
     Parameters
     ----------
@@ -274,17 +351,30 @@ def run_patchcraft_loop(
         Description of the bug/issue to fix.
     model : str
         Primary LLM model (litellm format).
-    max_retries : int
-        Maximum number of patch+test iterations (default 3).
+    max_retries : int | None
+        Hard cap on patch+test iterations. ``None`` (default) means the loop
+        runs until tests pass or a guardrail halts it.
     event_sink : Callable[[str, str], None] | None
         Optional callback invoked as ``event_sink(stage, message)`` at every
         milestone, for GUIs/loggers that need structured streaming. It must
         never raise; exceptions from the sink are swallowed and logged.
+    token_budget : int | None
+        Maximum total LLM tokens (prompt + completion) for the whole task.
+        ``None`` disables the check; falls back to ``PATCHCRAFT_TOKEN_BUDGET``.
+    time_budget_seconds : float | None
+        Wall-clock budget for the whole task; when exceeded the loop halts
+        gracefully. ``None`` disables the check; falls back to
+        ``PATCHCRAFT_TIME_BUDGET``.
+    min_remaining_credits : float | None
+        Halt when the OpenRouter remaining credit balance drops below this
+        value. ``None`` disables the check; falls back to
+        ``PATCHCRAFT_MIN_CREDITS``.
 
     Returns
     -------
-    :class:`RunResult` with the outcome, the report on success, and the test
-    errors of the failed iterations.
+    :class:`RunResult` with the outcome, the report on success, the test
+    errors of the failed iterations and, on failure, ``halt_reason``
+    explaining which guardrail stopped the loop.
     """
 
     def emit(stage: str, message: str) -> None:
@@ -302,10 +392,29 @@ def run_patchcraft_loop(
     if not issue_description.strip():
         raise ValueError("issue_description must not be empty.")
 
+    # Guardrail defaults from the environment (explicit arguments win).
+    if token_budget is None:
+        token_budget = _env_optional("PATCHCRAFT_TOKEN_BUDGET", int)
+    if time_budget_seconds is None:
+        time_budget_seconds = _env_optional("PATCHCRAFT_TIME_BUDGET", float)
+    if min_remaining_credits is None:
+        min_remaining_credits = _env_optional("PATCHCRAFT_MIN_CREDITS", float)
+
+    limit_desc = str(max_retries) if max_retries is not None else "until green"
     console.rule("[bold blue] PatchCraft — starting [/]")
     console.print(f"[bold]Repository:[/] {repo_root}")
-    console.print(f"[bold]Model:[/] {model}  |  [bold]Max retries:[/] {max_retries}")
-    emit("start", f"Repository: {repo_root} | Model: {model} | Max retries: {max_retries}")
+    console.print(f"[bold]Model:[/] {model}  |  [bold]Iterations:[/] {limit_desc} (goal-driven)")
+    emit(
+        "start",
+        f"Repository: {repo_root} | Model: {model} | Iterations: {limit_desc}",
+    )
+
+    started_at = time.monotonic()
+    usage: dict[str, int] = {"prompt": 0, "completion": 0}
+
+    def usage_sink(prompt_tokens: int, completion_tokens: int) -> None:
+        usage["prompt"] += prompt_tokens
+        usage["completion"] += completion_tokens
 
     with console.status("📖 Reading documentation and sources ..."):
         context = build_context(repo_root, issue_description)
@@ -314,7 +423,7 @@ def run_patchcraft_loop(
 
     console.rule("[bold magenta]🔍 Diagnostic analysis")
     with console.status("Calling the Diagnostic agent ..."):
-        diagnosis = diagnose(context, model)
+        diagnosis = diagnose(context, model, usage_sink=usage_sink)
     console.print(f"[bold]Summary:[/] {diagnosis.summary}")
     console.print(f"[bold]Root cause:[/] {diagnosis.root_cause}")
     console.print(f"[bold]Affected files:[/] {', '.join(diagnosis.affected_files)}")
@@ -337,11 +446,81 @@ def run_patchcraft_loop(
         console.print(f"[green]✓[/] Coder context ready ({len(coder_context)} chars).")
     else:
         console.print("[yellow]⚠ No affected files found on disk; coder will rely on the diagnosis only.[/]")
-    patch_budget = dynamic_patch_budget(max(1, len(diagnosis.affected_files)))
 
-    for attempt in range(1, max_retries + 1):
-        console.rule(f"[bold cyan] Iteration {attempt}/{max_retries} [/]")
-        emit("iteration", f"Iteration {attempt}/{max_retries}")
+    # Goal-driven loop state (loop detection + budget accounting).
+    attempt = 0
+    halt_reason: Optional[str] = None
+    strategy_directive = ""
+    previous_signature: Optional[str] = None
+    previous_patch_json: Optional[str] = None
+    stagnation_repeats = 0
+
+    def _register_failure(signature: str, patch_json: Optional[str]) -> bool:
+        """Track consecutive identical failures; True when the loop must halt."""
+        nonlocal stagnation_repeats, previous_signature, previous_patch_json
+        nonlocal strategy_directive, halt_reason
+        same_error = signature == previous_signature
+        same_patch = patch_json is not None and patch_json == previous_patch_json
+        stagnation_repeats = stagnation_repeats + 1 if (same_error or same_patch) else 1
+        previous_signature = signature
+        previous_patch_json = patch_json
+        if stagnation_repeats >= STAGNATION_HALT_AFTER:
+            halt_reason = (
+                f"Stagnation detected: the same failure repeated "
+                f"{stagnation_repeats} consecutive iterations without progress."
+            )
+            return True
+        if stagnation_repeats >= STAGNATION_STRATEGY_AFTER:
+            strategy_directive = (
+                f"STAGNATION WARNING: the same failure has now repeated "
+                f"{stagnation_repeats} times. You MUST change strategy: question "
+                f"your assumptions, try a fundamentally different approach and "
+                f"re-read the failing test output before patching again."
+            )
+        else:
+            strategy_directive = ""
+        return False
+
+    while True:
+        attempt += 1
+
+        # -- Guardrail: explicit retry cap (disabled unless configured) ------
+        if max_retries is not None and max_retries > 0 and attempt > max_retries:
+            attempt -= 1  # the aborted check does not count as an iteration
+            halt_reason = f"Iteration limit reached ({max_retries})."
+            break
+
+        # -- Guardrail: wall-clock time budget --------------------------------
+        if time_budget_seconds is not None and time.monotonic() - started_at > time_budget_seconds:
+            attempt -= 1
+            halt_reason = f"Time budget exhausted (limit: {time_budget_seconds} s)."
+            break
+
+        # -- Guardrail: per-task token budget ---------------------------------
+        tokens_used = usage["prompt"] + usage["completion"]
+        if token_budget is not None and tokens_used > token_budget:
+            attempt -= 1
+            halt_reason = f"Token budget exhausted ({tokens_used} tokens used > {token_budget})."
+            break
+
+        # -- Guardrail: OpenRouter credit floor -------------------------------
+        if min_remaining_credits is not None:
+            remaining = _remaining_credits()
+            if remaining is not None and remaining < min_remaining_credits:
+                attempt -= 1
+                halt_reason = (
+                    f"OpenRouter credits below the safety floor "
+                    f"({remaining:.2f} remaining < {min_remaining_credits:.2f})."
+                )
+                break
+
+        total_desc = str(max_retries) if max_retries is not None else "∞"
+        console.rule(f"[bold cyan] Iteration {attempt}/{total_desc} [/]")
+        emit("iteration", f"Iteration {attempt}/{total_desc}")
+
+        # Dynamic budget: grows with the number of files and each correction
+        # iteration, so later (larger) corrections are never truncated.
+        patch_budget = dynamic_patch_budget(max(1, len(diagnosis.affected_files)), attempt - 1)
 
         with console.status("✍️  Generating patch ..."):
             if attempt == 1:
@@ -350,14 +529,20 @@ def run_patchcraft_loop(
                     model,
                     repo_context=coder_context,
                     max_tokens=patch_budget,
+                    usage_sink=usage_sink,
                 )
             else:
+                feedback = "\n---\n".join(test_errors)
+                if strategy_directive:
+                    feedback = f"{strategy_directive}\n\n{feedback}"
                 candidate = correct_patch(
                     previous_patch=current_patch,
-                    test_feedback="\n---\n".join(test_errors),
+                    test_feedback=feedback,
                     provider_model=model,
                     repo_context=coder_context,
                     max_tokens=patch_budget,
+                    iteration=attempt - 1,
+                    usage_sink=usage_sink,
                 )
                 emit("patch", "Self-correcting patch generated.")
         current_patch = _coerce_patch(candidate)
@@ -370,6 +555,8 @@ def run_patchcraft_loop(
                 "and make sure the output is NOT truncated."
             )
             emit("error", "The generated patch was invalid or contained no modifiable files.")
+            if _register_failure("invalid-patch-output", None):
+                break
             continue
 
         new_snapshots = apply_patch(current_patch, repo_root)
@@ -406,7 +593,7 @@ def run_patchcraft_loop(
             diff = compute_diff(repo_root, original_snapshots)
             emit("diff", diff)
             with console.status("📝 Generating report ..."):
-                report = generate_report(diff, model)
+                report = generate_report(diff, model, usage_sink=usage_sink)
             emit("report", report.pr_markdown if isinstance(report, PatchReport) else str(report))
             if isinstance(report, PatchReport):
                 console.print(Panel(
@@ -437,21 +624,35 @@ def run_patchcraft_loop(
         test_errors.append("\n\n".join(feedback_parts))
         emit("error", "\n\n".join(feedback_parts))
 
-    # max_retries exhausted: roll back and fail.
+        # -- Guardrail: loop detection ----------------------------------------
+        patch_json = current_patch.model_dump_json() if isinstance(current_patch, Patch) else None
+        if _register_failure(_error_signature(test_result), patch_json):
+            break
+
+    # A guardrail stopped the loop: roll back and fail with a clear report.
     rollback(repo_root, original_snapshots)
+    reason = halt_reason or "The loop stopped without converging."
+    tokens_summary = usage["prompt"] + usage["completion"]
     console.print(Panel(
-        f"The test suite did not pass within {max_retries} iterations.\n"
+        f"The self-correction loop halted before all tests passed.\n"
+        f"[bold]Reason:[/] {reason}\n"
+        f"Iterations executed: {attempt} | LLM tokens used: {tokens_summary}\n"
         f"Detected errors:\n" + "\n".join(f"- {e[:400]}" for e in test_errors),
         title="[bold red]❌ Loop did not converge",
         border_style="red",
     ))
-    emit("done", f"The pipeline did not converge within {max_retries} iterations; changes rolled back.")
+    emit(
+        "done",
+        f"The pipeline halted: {reason} Changes rolled back "
+        f"({attempt} iteration(s), {tokens_summary} LLM tokens used).",
+    )
     return RunResult(
         success=False,
-        iterations=max_retries,
+        iterations=attempt,
         report=None,
         test_errors=test_errors,
         files_changed=[],
+        halt_reason=halt_reason,
     )
 
 

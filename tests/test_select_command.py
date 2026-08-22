@@ -34,7 +34,8 @@ def test_select_success_pipeline() -> None:
     assert loop_mock.call_count == 1
     _, kwargs = loop_mock.call_args
     assert kwargs["repo_path"] == "./local"
-    assert kwargs["max_retries"] == 3
+    # default is now the goal-driven loop: no arbitrary retry cut-off
+    assert kwargs["max_retries"] is None
     assert "Title: secondo" in kwargs["issue_description"]
     assert "corpo 27" in kwargs["issue_description"]
 

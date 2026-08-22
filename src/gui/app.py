@@ -64,7 +64,7 @@ class PatchCraftApp(App[None]):
     def __init__(
         self,
         default_model: Optional[str] = None,
-        max_retries: int = 3,
+        max_retries: Optional[int] = None,
         load_credits_on_mount: bool = True,
     ) -> None:
         super().__init__()

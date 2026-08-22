@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Mapping, Optional, Sequence, Type, Union, overload
+from typing import Any, Callable, Mapping, Optional, Sequence, Type, Union, overload
 
 import litellm
 from litellm.exceptions import (
@@ -39,6 +39,11 @@ DEFAULT_MAX_RETRIES_PER_MODEL = 2
 DEFAULT_TIMEOUT_SECONDS = 60.0
 DEFAULT_BACKOFF_SECONDS = 1.0
 DEFAULT_MAX_BACKOFF_SECONDS = 16.0
+
+# Type alias for the optional token-usage callback: invoked as
+# ``usage_sink(prompt_tokens, completion_tokens)`` after every successful
+# completion so callers can enforce per-task token budgets.
+UsageSink = Callable[[int, int], None]
 
 # Cap on completion output tokens. Requesting very large budgets (e.g. 16384)
 # makes OpenRouter reject the call with HTTP 402 (insufficient credits) even
@@ -204,6 +209,29 @@ def _extract_content(response: Any) -> Any:
         raise LLMResponseError(f"Unexpected provider response: {response!r}") from exc
 
 
+def _extract_usage(response: Any) -> tuple[int, int]:
+    """Extract ``(prompt_tokens, completion_tokens)`` from a response.
+
+    Returns ``(0, 0)`` when the provider does not report usage information.
+    """
+    try:
+        if isinstance(response, Mapping):
+            usage = response.get("usage")
+        else:
+            usage = getattr(response, "usage", None)
+        if not usage:
+            return 0, 0
+        if isinstance(usage, Mapping):
+            prompt = int(usage.get("prompt_tokens") or 0)
+            completion = int(usage.get("completion_tokens") or 0)
+        else:
+            prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+            completion = int(getattr(usage, "completion_tokens", 0) or 0)
+        return prompt, completion
+    except (TypeError, ValueError, AttributeError):
+        return 0, 0
+
+
 def _as_text(content: Any) -> str:
     """Normalize content into plain text (supports strings and blocks)."""
     if isinstance(content, str):
@@ -255,6 +283,7 @@ def call_llm(
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> str: ...
 
 
@@ -270,6 +299,7 @@ def call_llm(
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> BaseModel: ...
 
 
@@ -284,6 +314,7 @@ def call_llm(
     backoff_base: float = DEFAULT_BACKOFF_SECONDS,
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> Union[str, BaseModel]:
     """Query the LLM with automatic cross-model fallback.
 
@@ -309,6 +340,11 @@ def call_llm(
         Maximum completion output tokens. ``None`` uses the conservative
         default (:data:`DEFAULT_MAX_OUTPUT_TOKENS`); raise it for calls that
         must emit large payloads (e.g. complete-file patches).
+    usage_sink : Callable[[int, int], None] | None
+        Optional callback invoked as ``usage_sink(prompt_tokens,
+        completion_tokens)`` after every successful completion, so callers
+        can enforce per-task token budgets. Never raises into the loop:
+        sink exceptions are swallowed and logged.
 
     Returns
     -------
@@ -329,6 +365,13 @@ def call_llm(
         for attempt in range(1, max_retries_per_model + 1):
             try:
                 response = litellm.completion(**completion_kwargs)
+                if usage_sink is not None:
+                    try:
+                        prompt_toks, completion_toks = _extract_usage(response)
+                        if prompt_toks or completion_toks:
+                            usage_sink(prompt_toks, completion_toks)
+                    except Exception as exc:  # noqa: BLE001 - sink must never break the loop
+                        logger.warning("usage_sink raised: %s: %s", type(exc).__name__, exc)
                 content = _extract_content(response)
                 if json_schema is None:
                     return _as_text(content)

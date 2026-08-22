@@ -1,7 +1,7 @@
 """Reporter agent: produces the diff and the markdown for the Pull Request."""
 from __future__ import annotations
 
-from typing import Optional, Type, Union
+from typing import Callable, Optional, Type, Union
 
 from pydantic import BaseModel, Field
 
@@ -27,6 +27,7 @@ def generate_report(
     diff: str,
     provider_model: str,
     json_schema: Optional[Type[BaseModel]] = None,
+    usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> Union[str, BaseModel]:
     """Generate a report (defaults to :class:`PatchReport`) from a diff."""
     return call_llm(
@@ -34,4 +35,5 @@ def generate_report(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=diff,
         json_schema=json_schema or PatchReport,
+        usage_sink=usage_sink,
     )
