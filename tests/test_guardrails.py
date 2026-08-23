@@ -74,7 +74,7 @@ class TestGoalDrivenLoop:
         _write(tmp_path, "src/app.py", "x = 1\n")
         counter = {"n": 0}
 
-        def _always_fail():
+        def _always_fail(**kwargs):
             counter["n"] += 1
             return _fail(f"unique-failure-{counter['n']}")
 
@@ -214,3 +214,4 @@ class TestBudgetLimits:
         assert result.success is False
         assert result.halt_reason is not None
         assert "credit" in result.halt_reason.lower()
+

@@ -283,4 +283,4 @@ class TestSmartGuardrails:
         assert "return a - b" in captured["repo_context"], (
             "il coder deve vedere il contenuto attuale del file"
         )
-        assert captured["max_tokens"] >= 6000, "budget dinamico per patch complete"
+        assert captured["max_tokens"] >= 4000, "budget dinamico per patch complete"

@@ -30,7 +30,7 @@ def test_dynamic_patch_budget_scales_and_is_capped() -> None:
     one = dynamic_patch_budget(1)
     three = dynamic_patch_budget(3)
     huge = dynamic_patch_budget(100)
-    assert one == 6000
+    assert one == 4000
     assert three > one
     assert huge == MAX_PATCH_MAX_TOKENS
     # valori degenerei
@@ -82,5 +82,6 @@ def test_correct_patch_includes_feedback_and_context() -> None:
     assert "FAILED test_add" in user_msg  # feedback test
     assert "CURRENT FILE CONTENTS" in user_msg  # contesto reale
     assert mocked.call_args.kwargs["max_tokens"] == dynamic_patch_budget(1)
+
 
 

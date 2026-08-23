@@ -200,13 +200,45 @@ class SandboxRunner:
             return [os.environ.get("ComSpec", "cmd.exe"), "/d", "/s", "/c", *command]
         return command
 
-    def run_tests(self) -> TestResult:
+    @staticmethod
+    def _with_pytest_targets(
+        command: list[str],
+        targets: Sequence[str],
+        ) -> list[str]:
+        """Append ``targets`` to a pytest command (no-op for non-pytest).
+
+        Only appends when the base command is pytest (``python -m pytest``);
+        for npm/pnpm/yarn targets are ignored so the full suite runs.
+        """
+        # Detect pytest-based commands: ["python", "-m", "pytest"] or a direct
+        # "pytest" executable.
+        is_pytest = (
+            "pytest" in command
+            or (len(command) >= 3 and command[-3:] == [sys.executable, "-m", "pytest"])
+        )
+        if not is_pytest:
+            return command
+        return [*command, "--", *targets]
+
+    def run_tests(self, targets: Optional[Sequence[str]] = None) -> TestResult:
         """Run the tests and return a :class:`TestResult`.
 
         On timeout the process and its children are killed; the result reports
         ``success=False``, ``exit_code=124`` and the partial output.
+
+        Parameters
+        ----------
+        targets
+            Optional list of pytest node IDs (file paths, ``file::node`` or
+            ``file::class::test``).  When provided with a pytest-based project
+            the targets are appended to the command so only the relevant tests
+            run.  For non-pytest projects (npm/pnpm/yarn) targets are ignored
+            and the full suite runs.
         """
-        command = self._resolve_windows_cmd(self._detect_test_command())
+        base_command = self._detect_test_command()
+        command = self._resolve_windows_cmd(base_command)
+        if targets:
+            command = self._with_pytest_targets(command, targets)
         try:
             proc = subprocess.Popen(
                 command,

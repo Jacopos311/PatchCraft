@@ -11,26 +11,63 @@ chat default (which would truncate the JSON and silently discard the patch).
 from __future__ import annotations
 
 import json
+import os
 from typing import Callable, Optional, Type, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src.core.llm import call_llm
 
 
 class FilePatch(BaseModel):
-    """A single file to create or overwrite."""
+    """A single file to create (whole content) or modify (surgical edits)."""
 
     file_path: str = Field(
         description="Path of the file relative to the project root (e.g. src/calc.py)."
     )
     new_content: str = Field(
-        description="COMPLETE final content of the file (not a partial diff)."
+        default="",
+        description=(
+            "COMPLETE final content of the file. Use ONLY to create brand-new "
+            "files — for existing files prefer surgical 'edits'."
+        ),
     )
+    edits: list["EditHunk"] = Field(
+        default_factory=list,
+        description=(
+            "Search/replace hunks for an EXISTING file, applied top-to-bottom "
+            "on its current content."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_payload(self) -> "FilePatch":
+        has_content = bool(self.new_content and self.new_content.strip())
+        has_edits = bool(self.edits)
+        if has_content and has_edits:
+            raise ValueError(
+                "use either 'new_content' (to create a new file) or 'edits' "
+                "(to modify an existing file), not both"
+            )
+        if not has_content and not has_edits:
+            raise ValueError("provide 'new_content' or a non-empty 'edits' list")
+        return self
+
+
+class EditHunk(BaseModel):
+    """One surgical search/replace hunk within an existing file."""
+
+    find: str = Field(
+        description=(
+            "EXACT snippet copied from the current file content, including "
+            "2-4 surrounding lines so the anchor is unique."
+        )
+    )
+    replace: str = Field(description="The replacement snippet (may be empty to delete).")
 
 
 class Patch(BaseModel):
-    """A complete patch: set of files to create/modify."""
+    """A complete patch: set of files to create or modify."""
 
     files: list[FilePatch] = Field(description="List of files to create or modify.")
     notes: str = Field(
@@ -38,16 +75,20 @@ class Patch(BaseModel):
     )
 
 
+Patch.model_rebuild()
+
+
 # ---------------------------------------------------------------------------
 # Dynamic completion budget ("dynamic completion" guardrail)
 # ---------------------------------------------------------------------------
-# A patch must contain the COMPLETE content of every file it touches. The
-# default chat budget (~3000 tokens) truncates such JSON mid-string, the
-# payload fails to parse and the whole patch is lost. The budget therefore
-# scales with the number of files involved and is hard-capped to stay within
-# what OpenRouter models accept.
-BASE_PATCH_MAX_TOKENS = 6000       # covers a single focused file rewrite
-PER_FILE_EXTRA_TOKENS = 2500       # extra head-room for each additional file
+# Surgical search/replace patches are SMALL: a few anchored hunks instead of
+# whole-file rewrites, so the baseline budget is far lower than in the
+# whole-file era. Whole content is still emitted for brand-new files, which
+# the per-file scaling covers; the hard cap keeps calls within what
+# OpenRouter models accept.
+BASE_PATCH_MAX_TOKENS = 4000       # covers several surgical hunks or a small new file
+PER_FILE_EXTRA_TOKENS = 2000       # extra head-room for each additional file
+MIN_FILE_EXTRA_BUDGET = 2000       # minimum extra budget per correction iteration
 MAX_PATCH_MAX_TOKENS = 16000       # never exceed common model output limits
 MIN_FILE_EXTRA_BUDGET = 2000       # minimum extra budget per correction iteration
 
@@ -61,21 +102,25 @@ def dynamic_patch_budget(num_files: int, correction_iteration: int = 0) -> int:
 
 SYSTEM_PROMPT = (
     "You are a senior engineer. Write a focused, minimal patch for the task "
-    "described in the diagnosis. For EACH file to create or modify, provide "
-    "its path RELATIVE to the project root and its COMPLETE working content. "
-    "Base every change on the ACTUAL current file contents provided in the "
-    "context — never invent code you have not seen. Do not use placeholders, "
-    "'...' elisions or partial diffs: the content will be written verbatim "
-    "to disk. Respond with a single valid JSON object matching the schema."
+    "described in the diagnosis. For each EXISTING file, return surgical "
+    "search/replace edits: 'find' must be an EXACT snippet copied from the "
+    "current file content including 2-4 surrounding lines so the anchor is "
+    "unique, and 'replace' holds the corrected version of that snippet. Use "
+    "'new_content' ONLY to create brand-new files. Base every change on the "
+    "ACTUAL current file contents provided in the context — never invent code "
+    "you have not seen. No placeholders or elisions: hunks are applied "
+    "verbatim, top-to-bottom. Respond with a single valid JSON object "
+    "matching the schema."
 )
 
 CORRECTION_PROMPT = (
     "You are a senior engineer in a self-correction loop. The project tests "
     "FAILED after the previous patch was applied. Analyze the test output, "
-    "identify the error and return a CORRECTED patch: provide the complete "
-    "working content of every file to create or modify, based on the actual "
-    "file contents in the context. Respond with a single valid JSON object "
-    "matching the schema."
+    "identify the error and return a CORRECTED patch as surgical "
+    "search/replace edits based on the actual file contents in the context "
+    "('new_content' only for brand-new files). If previous edit failures were "
+    "reported, fix the 'find' snippets to match the real content exactly. "
+    "Respond with a single valid JSON object matching the schema."
 )
 
 
@@ -93,15 +138,8 @@ def _files_in_payload(payload: object, key: str) -> int:
     return 1
 
 
-def _append_context(user_prompt: str, repo_context: Optional[str]) -> str:
-    """Append the repository context section to a coder prompt."""
-    if not repo_context or not repo_context.strip():
-        return user_prompt
-    return (
-        f"{user_prompt}\n\n"
-        "# CURRENT FILE CONTENTS (ground truth — base your patch on these)\n"
-        f"{repo_context}"
-    )
+def _prompt_cache_budget() -> int:
+    return int(os.getenv("PATCHCRAFT_PROMPT_BUDGET", "16000"))
 
 
 def generate_patch(
@@ -135,10 +173,17 @@ def generate_patch(
     """
     if max_tokens is None:
         max_tokens = dynamic_patch_budget(_files_in_payload(diagnosis, "affected_files"))
+    from src.core.prompts import TRIM_HEAD, PromptCompiler
+
+    compiler = PromptCompiler(max_tokens=_prompt_cache_budget())
+    compiler.add("instructions", SYSTEM_PROMPT, priority=1)
+    compiler.add("repo_context", _format_repo_context(repo_context), priority=2)
+    compiler.add("diagnosis", str(diagnosis), priority=1, trim=TRIM_HEAD)
+
     return call_llm(
         provider_model=provider_model,
         system_prompt=SYSTEM_PROMPT,
-        user_prompt=_append_context(str(diagnosis), repo_context),
+        user_prompt=compiler.compile().text,
         json_schema=json_schema or Patch,
         max_tokens=max_tokens,
         usage_sink=usage_sink,
@@ -154,6 +199,7 @@ def correct_patch(
     repo_context: Optional[str] = None,
     max_tokens: Optional[int] = None,
     iteration: int = 0,
+    prompt_budget: Optional[int] = None,
     usage_sink: Optional[Callable[[int, int], None]] = None,
 ) -> Union[str, BaseModel]:
     """Self-correction: fix the patch using the failed test output.
@@ -174,7 +220,9 @@ def correct_patch(
         Completion budget; when ``None`` it is derived from the size of the
         previous patch.
     iteration : int
-        Current correction iteration count (used to increase budget)
+        Current correction iteration count (used to increase budget).
+    prompt_budget : int | None
+        Prompt (context) token budget for the corrector.
     usage_sink : Callable[[int, int], None] | None
         Optional ``(prompt_tokens, completion_tokens)`` callback for
         per-task token accounting.
@@ -183,16 +231,35 @@ def correct_patch(
         previous_patch = previous_patch.model_dump_json(indent=2)
     if max_tokens is None:
         max_tokens = dynamic_patch_budget(_files_in_payload(previous_patch, "files"), iteration)
-    user_prompt = (
-        f"HERE IS THE PREVIOUS PATCH (already applied to files):\n{previous_patch}\n\n"
-        f"Here is the TEST FAILURE output:\n{test_feedback}\n\n"
-        "Return the corrected patch (COMPLETE file contents)."
+
+    from src.core.prompts import TRIM_HEAD, TRIM_TAIL, PromptCompiler
+
+    compiler = PromptCompiler(max_tokens=prompt_budget or _prompt_cache_budget())
+    compiler.add("instructions", CORRECTION_PROMPT, priority=1)
+    compiler.add("repo_context", _format_repo_context(repo_context), priority=2)
+    compiler.add("previous_patch", f"PREVIOUS PATCH (already applied):\n{previous_patch}", priority=3)
+    compiler.add(
+        "test_feedback",
+        f"TEST FAILURE OUTPUT:\n{test_feedback}",
+        priority=4,
+        trim=TRIM_TAIL,  # summaries live at the end of the feedback
     )
+
     return call_llm(
         provider_model=provider_model,
         system_prompt=CORRECTION_PROMPT,
-        user_prompt=_append_context(user_prompt, repo_context),
+        user_prompt=compiler.compile().text,
         json_schema=json_schema or Patch,
         max_tokens=max_tokens,
         usage_sink=usage_sink,
+    )
+
+
+def _format_repo_context(repo_context: Optional[str]) -> str:
+    """Wrap raw repo context with its ground-truth header (if any content)."""
+    if not repo_context or not repo_context.strip():
+        return ""
+    return (
+        "# CURRENT FILE CONTENTS (ground truth — base your patch on these)\n"
+        f"{repo_context}"
     )

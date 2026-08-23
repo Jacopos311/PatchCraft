@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -34,10 +35,22 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 
-from src.agents.coder import Patch, correct_patch, dynamic_patch_budget, generate_patch
+from src.agents.coder import (
+    EditHunk,
+    Patch,
+    correct_patch,
+    dynamic_patch_budget,
+    generate_patch,
+)
 from src.agents.diagnostic import diagnose
 from src.agents.reporter import PatchReport, generate_report
 from src.sandbox.runner import SandboxRunner
+
+# Lazy-imported targeted test selection (Step 2.1) — see _select_test_targets().
+from src.core.targeted_tests import (
+    TestSelectionResult as _TestSelectionResult,
+    select_targeted_tests as _select_targeted_tests,
+)
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -171,9 +184,40 @@ def _discover_source_files(repo_root: Path) -> list[Path]:
     return sources
 
 
-def build_context(repo_root: Path, issue_description: str) -> str:
-    """Compose the context for the model: issue + repo map + docs + sources."""
-    sections: list[str] = [f"# ISSUE TO SOLVE\n{issue_description.strip()}"]
+def _prompt_budget(env_name: str, default_tokens: int) -> int:
+    """Read an optional prompt-budget env override (positive tokens)."""
+    try:
+        from src.core.prompts import estimate_tokens
+    except Exception:  # noqa: BLE001 - a broken override must never break context building
+        estimate_tokens = None  # type: ignore[assignment]
+    raw = os.getenv(env_name)
+    if not raw or not raw.strip():
+        return default_tokens
+    try:
+        value = int(raw)
+        return value if value > 0 else default_tokens
+    except ValueError:
+        logger.warning("Invalid %s=%r — using default %d tokens.", env_name, raw, default_tokens)
+        return default_tokens
+
+
+def build_context(repo_root: Path, issue_description: str, max_tokens: Optional[int] = None) -> str:
+    """Compose the context for the model: issue + repo map + docs + sources.
+
+    Assembled with the priority-aware prompt compiler (Step 1.4): issue text
+    is always kept, repo map comes before docs/sources, and the lowest-
+    priority sections (raw source files) are trimmed/dropped first when the
+    budget runs out.
+    """
+    if max_tokens is None:
+        max_tokens = _prompt_budget("PATCHCRAFT_CONTEXT_BUDGET", int(MAX_CONTEXT_CHARS / 5))
+    from src.core.prompts import TRIM_HEAD, PromptCompiler
+
+    compiler = PromptCompiler(max_tokens=max_tokens)
+
+    issue = issue_description.strip()
+    if issue:
+        compiler.add("issue", f"# ISSUE TO SOLVE\n{issue}", priority=1, trim=TRIM_HEAD)
 
     # Structural overview first (Roadmap Step 1.1): a compact symbol map of
     # the whole repository, built incrementally and cached on disk.
@@ -184,7 +228,7 @@ def build_context(repo_root: Path, issue_description: str) -> str:
         repo_index_obj = RepoIndex.build(repo_root)
         repo_map_text = repo_index_obj.repo_map()
         if repo_map_text:
-            sections.append(f"# REPOSITORY MAP\n{repo_map_text}")
+            compiler.add("repo_map", f"# REPOSITORY MAP\n{repo_map_text}", priority=2)
     except Exception as exc:  # noqa: BLE001 - indexing must never break context building
         logger.debug("Repo index unavailable (%s: %s); continuing without map.", type(exc).__name__, exc)
 
@@ -205,47 +249,41 @@ def build_context(repo_root: Path, issue_description: str) -> str:
     for doc in docs:
         content = _read_text_limited(doc, limit=MAX_FILE_CHARS)
         if content:
-            sections.append(f"# FILE: {doc.relative_to(repo_root)}\n```\n{content}\n```")
+            compiler.add(f"doc:{doc.relative_to(repo_root).as_posix()}", f"# FILE: {doc.relative_to(repo_root)}\n```\n{content}\n```", priority=3)
 
     sources = _discover_source_files(repo_root)
+    if repo_index_obj is not None and sources:
+        try:
+            from src.core.retrieval import DEFAULT_RETRIEVAL_K, select_files
 
-    # Retrieval-first ordering (Roadmap Step 1.2): the top-k files for THIS
-    # issue are always included ahead of the alphabetical remainder, so the
-    # MAX_SOURCE_FILES cap can no longer drop the files that matter.
-    retrieved: list[Path] = []
-    try:
-        from src.core.retrieval import DEFAULT_RETRIEVAL_K, select_files
-
-        if repo_index_obj is not None and sources:
-            try:
-                k = int(os.getenv("PATCHCRAFT_RETRIEVAL_K", str(DEFAULT_RETRIEVAL_K)))
-            except ValueError:
-                k = DEFAULT_RETRIEVAL_K
+            k = _prompt_budget("PATCHCRAFT_RETRIEVAL_K", DEFAULT_RETRIEVAL_K)
             retrieved = [
                 repo_root / rel
                 for rel in select_files(issue_description, repo_index_obj, k=k)
                 if (repo_root / rel).is_file()
             ]
-    except Exception as exc:  # noqa: BLE001 - retrieval must never break context building
-        logger.debug("Retrieval skipped (%s: %s).", type(exc).__name__, exc)
+        except Exception as exc:  # noqa: BLE001 - retrieval must never break context building
+            logger.debug("Retrieval skipped (%s: %s).", type(exc).__name__, exc)
+            retrieved = []
+    else:
+        retrieved = []
 
     resolved_retrieved = {p.resolve() for p in retrieved}
     rest = [p for p in sources if p.resolve() not in resolved_retrieved]
     ordered_sources = [*retrieved, *rest[:MAX_SOURCE_FILES]]
 
-    total = sum(len(s) if isinstance(s, str) else 0 for s in sections)
     for source in ordered_sources:
         content = _read_text_limited(source)
-        header_len = len(f"\n# FILE: {source.relative_to(repo_root)}\n```\n```\n")
-        if total + len(content) + header_len > MAX_CONTEXT_CHARS:
-            break
+        if not content:
+            continue
         marker = " [RETRIEVED: relevant to this issue]" if source in retrieved else ""
-        sections.append(
-            f"\n# FILE: {source.relative_to(repo_root)}{marker}\n```\n{content}\n```\n"
+        compiler.add(
+            f"source:{source.relative_to(repo_root).as_posix()}",
+            f"# FILE: {source.relative_to(repo_root)}{marker}\n```\n{content}\n```",
+            priority=4,
         )
-        total += len(content) + header_len
 
-    return "\n".join(sections)
+    return compiler.compile().text
 
 
 def build_coder_context(repo_root: Path, affected_files: Sequence[str]) -> str:
@@ -264,8 +302,9 @@ def build_coder_context(repo_root: Path, affected_files: Sequence[str]) -> str:
     except Exception as exc:  # noqa: BLE001 - resolution must never break context building
         logger.debug("Affected-path resolution skipped (%s: %s).", type(exc).__name__, exc)
 
-    sections: list[str] = []
-    total = 0
+    from src.core.prompts import PromptCompiler
+
+    compiler = PromptCompiler(max_tokens=_prompt_budget("PATCHCRAFT_CODER_BUDGET", int(MAX_CONTEXT_CHARS / 2)))
     seen: set[Path] = set()
     for rel in affected_files:
         if not rel or not rel.strip():
@@ -277,33 +316,114 @@ def build_coder_context(repo_root: Path, affected_files: Sequence[str]) -> str:
         content = _read_text_limited(target)
         if not content:
             continue
-        header = f"\n# FILE: {target.relative_to(repo_root).as_posix()}\n```\n```\n"
-        if total + len(content) + len(header) > MAX_CONTEXT_CHARS:
-            console.print(f"[yellow]⚠ Coder context budget reached, skipping: {rel}[/]")
-            break
-        sections.append(f"# FILE: {target.relative_to(repo_root).as_posix()}\n```\n{content}\n```")
-        total += len(content) + len(header)
-    return "\n\n".join(sections)
+        compiler.add(
+            f"src:{target.relative_to(repo_root).as_posix()}",
+            f"# FILE: {target.relative_to(repo_root).as_posix()}\n```\n{content}\n```",
+            priority=2,  # affected-file content: kept before everything optional
+        )
+    return compiler.compile().text
 
 
 # ---------------------------------------------------------------------------
 # Applying patches to the real files
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class PatchApplyResult:
+    """Outcome of :func:`apply_patch_detailed`."""
+
+    snapshots: dict[Path, Optional[str]] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
+
+
+def _normalize_line(line: str) -> str:
+    """Whitespace-insensitive form of a line used for tolerant matching."""
+    return " ".join(line.split())
+
+
+def apply_edits_to_text(
+    content: str,
+    hunks: Sequence[EditHunk],
+) -> tuple[str, list[str]]:
+    """Apply surgical search/replace hunks to ``content``.
+
+    Matching strategy per hunk, in order: exact substring; then a single
+    whitespace-normalized line-window match (tolerates indentation drift and
+    EOL differences). Ambiguous or missing anchors abort the whole file edit:
+    the original content is returned together with actionable problem
+    descriptions for the self-correction loop (atomic per file).
+    """
+    problems: list[str] = []
+    working = content
+
+    for idx, hunk in enumerate(hunks, start=1):
+        find, replace = hunk.find, hunk.replace
+        if not find.strip():
+            problems.append(f"edit #{idx}: the 'find' snippet is empty.")
+            break  # offsets of later hunks are unreliable after a failure
+
+        occurrences = working.count(find)
+        if occurrences == 1:
+            working = working.replace(find, replace, 1)
+            continue
+        if occurrences > 1:
+            problems.append(
+                f"edit #{idx}: 'find' snippet matches {occurrences} locations "
+                f"(ambiguous). Include more surrounding lines to make it unique."
+            )
+            break
+
+        # Whitespace-tolerant fallback on normalized lines.
+        src_keep = working.splitlines(keepends=True)
+        src_norm = [_normalize_line(line) for line in src_keep]
+        norm_find = [_normalize_line(line) for line in find.splitlines()]
+        span = len(norm_find)
+        matches = (
+            [i for i in range(len(src_norm) - span + 1) if src_norm[i:i + span] == norm_find]
+            if span and span <= len(src_norm)
+            else []
+        )
+        if len(matches) != 1:
+            detail = f"matches {len(matches)} locations approximately" if matches else "was not found"
+            preview = find if len(find) <= 120 else find[:117] + "..."
+            problems.append(
+                f"edit #{idx}: 'find' snippet {detail}: {preview!r}. Copy it "
+                f"EXACTLY from the current file content shown in the context."
+            )
+            break
+
+        start = matches[0]
+        end = start + span
+        last_original = src_keep[end - 1]
+        eol = "\r\n" if last_original.endswith("\r\n") else ("\n" if last_original.endswith("\n") else "")
+        repl_lines = replace.splitlines()
+        replacement = [line + "\n" for line in repl_lines[:-1]]
+        if repl_lines:
+            replacement.append(repl_lines[-1] + eol)
+        src_keep[start:end] = replacement
+        working = "".join(src_keep)
+
+    if problems:
+        # Atomic per file: never leave a half-applied multi-hunk edit.
+        return content, problems
+    return working, []
+
+
 def _resolve_patch_path(patch_file: str, repo_root: Path) -> Optional[Path]:
     """Resolve a patch path safely inside ``repo_root``.
 
     Returns ``None`` if the patch attempts to escape the repo root
     (path traversal) — in that case the change is discarded.
     """
+    root = Path(repo_root).expanduser().resolve()  # tolerate relative roots
     raw = Path(patch_file.replace("\\", "/"))
     if raw.is_absolute():
         # If the model emitted an absolute path, try to map it back to the repo.
         try:
-            raw = raw.relative_to(repo_root)
+            raw = raw.relative_to(root)
         except ValueError:
             return None
-    candidate = (repo_root / raw).resolve()
-    if candidate != repo_root and repo_root not in candidate.parents:
+    candidate = (root / raw).resolve()
+    if candidate != root and root not in candidate.parents:
         console.print(f"[yellow]⚠ Path outside the repo discarded: {patch_file}[/]")
         return None
     return candidate
@@ -314,17 +434,58 @@ def apply_patch(patch: Patch, repo_root: Path) -> dict[Path, Optional[str]]:
 
     Returns a snapshot ``{path: original_content|None}`` of the modified
     files, used to compute the diff or roll back. ``None`` means the file did
-    not exist before (it will be created).
+    not exist before (it will be created). Use :func:`apply_patch_detailed`
+    when per-file application problems are needed as self-correction feedback.
     """
+    return apply_patch_detailed(patch, repo_root).snapshots
+
+
+def apply_patch_detailed(patch: Patch, repo_root: Path) -> PatchApplyResult:
+    """Apply a patch, returning snapshots plus actionable application problems."""
+    repo_root = repo_root.expanduser().resolve()  # tolerate relative roots
     applied: dict[Path, Optional[str]] = {}
+    problems: list[str] = []
     if not patch.files:
         console.print("[yellow]The patch contains no files: no changes applied.[/]")
-        return applied
+        return PatchApplyResult(applied, problems)
 
     for file_patch in patch.files:
         target = _resolve_patch_path(file_patch.file_path, repo_root)
         if target is None:
             continue
+
+        if file_patch.edits:
+            # Surgical mode: modify an existing file via search/replace hunks.
+            if not target.is_file():
+                problems.append(
+                    f"{file_patch.file_path}: cannot apply edits — file does not "
+                    f"exist. Use 'new_content' instead to create it."
+                )
+                console.print(f"[yellow]⚠ {file_patch.file_path}: edits skipped (missing file)[/]")
+                continue
+            try:
+                original = target.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                problems.append(f"{file_patch.file_path}: cannot read file ({exc}).")
+                continue
+            new_content, edit_problems = apply_edits_to_text(original, file_patch.edits)
+            if edit_problems:
+                problems.extend(f"{file_patch.file_path}: {p}" for p in edit_problems)
+                console.print(f"[red]✗ {file_patch.file_path}: {len(edit_problems)} edit(s) failed[/]")
+                continue
+            if new_content == original:
+                console.print(f"[dim]{target.relative_to(repo_root)} already up to date[/]")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_content, encoding="utf-8")
+            applied[target] = original
+            console.print(
+                f"[green] ✔ {target.relative_to(repo_root)} "
+                f"(modified, {len(file_patch.edits)} surgical edit(s))[/]"
+            )
+            continue
+
+        # Whole-content mode: create a brand-new file or fully rewrite one.
         original: Optional[str] = None
         if target.is_file():
             original = target.read_text(encoding="utf-8", errors="replace")
@@ -338,7 +499,7 @@ def apply_patch(patch: Patch, repo_root: Path) -> dict[Path, Optional[str]]:
         rel = target.relative_to(repo_root)
         status = "created" if original is None else "modified"
         console.print(f"[green] ✔ {rel} ({status})[/]")
-    return applied
+    return PatchApplyResult(applied, problems)
 
 
 def compute_diff(repo_root: Path, snapshots: dict[Path, Optional[str]]) -> str:
@@ -369,6 +530,59 @@ def rollback(repo_root: Path, snapshots: dict[Path, Optional[str]]) -> None:
         else:
             target.write_text(original, encoding="utf-8")
     console.print("[yellow]↩ Files restored to their original contents.[/]")
+
+
+# ---------------------------------------------------------------------------
+# Targeted test execution (Step 2.1)
+# ---------------------------------------------------------------------------
+def _run_tests_or_fallback(
+    runner: SandboxRunner,
+    repo_root: Path,
+    changed_files: list[str],
+    selection,
+    emit: Callable[[str, str], None],
+):
+    """Run targeted tests when available; fall back to the full suite.
+
+    Two-phase strategy:
+    1. If targeted tests were found for the changed files, run them first.
+       A failure here is definitive (the patch broke something specific) and
+       saves a full-suite run.
+    2. Only when targeted tests pass, run the FULL suite as the final gate —
+       this catches regressions in unrelated code that the import graph
+       couldn't predict.
+
+    Returns the final :class:`TestResult` (always from the full suite when
+    targeted passed, from targeted when they failed, or from the full suite
+    directly when no targets were available).
+    """
+    if selection is not None and selection.has_targets:
+        targets = selection.node_ids
+        emit("test", f"Running {len(targets)} targeted test file(s): {', '.join(targets)}")
+        console.print(f"[cyan]🎯 Targeted tests:[/] {len(targets)} file(s)")
+        targeted_result = runner.run_tests(targets=targets)
+
+        if not targeted_result.success:
+            console.print("[bold red]❌ Targeted tests failed — skipping full suite.[/]")
+            return targeted_result
+
+        # Targeted green → run the full suite as the final gate.
+        console.print("[green]✅ Targeted tests passed — running full suite as gate.[/]")
+        full_result = runner.run_tests()
+        if not full_result.success:
+            console.print(
+                "[bold red]❌ Full suite failed even though targeted tests "
+                "passed — possible regression outside the changed files.[/]"
+            )
+            return full_result
+        # Both green → report the full-suite result (authoritative).
+        return full_result
+
+    if selection is not None and selection.notes:
+        for note in selection.notes:
+            console.print(f"[dim]{note}[/]")
+
+    return runner.run_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -606,7 +820,17 @@ def run_patchcraft_loop(
                 break
             continue
 
-        new_snapshots = apply_patch(current_patch, repo_root)
+        apply_result = apply_patch_detailed(current_patch, repo_root)
+        new_snapshots = apply_result.snapshots
+        if apply_result.problems:
+            for problem in apply_result.problems:
+                console.print(f"[red]✗ {problem}[/]")
+                test_errors.append(
+                    f"Surgical patch problem: {problem} Re-read the CURRENT file "
+                    f"content in the context and copy the 'find' snippet EXACTLY "
+                    f"as it appears (2-4 surrounding lines)."
+                )
+            emit("error", "Some surgical edits failed to apply:\n" + "\n".join(apply_result.problems))
         if not new_snapshots:
             console.print("[yellow]The patch produced no applicable changes.[/]")
         else:
@@ -620,9 +844,22 @@ def run_patchcraft_loop(
         files_changed = [str(p.relative_to(repo_root)) for p in original_snapshots]
 
         console.rule("[bold cyan]🧪 Running tests")
-        with console.status("Running the test suite ..."):
+        with console.status("Running tests ..."):
             runner = SandboxRunner(repo_root)
-            test_result = runner.run_tests()
+
+            # -- Step 2.1: Targeted test selection -----------------------
+            changed = [str(p.relative_to(repo_root).as_posix())
+                       for p in new_snapshots]
+            selection = None
+            if changed:
+                try:
+                    selection = _select_targeted_tests(repo_root, changed)
+                except Exception as exc:
+                    logger.debug("Targeted test selection skipped (%s).", exc)
+
+            test_result = _run_tests_or_fallback(
+                runner, repo_root, changed, selection, emit
+            )
         emit(
             "test",
             f"exit_code={test_result.exit_code} success={test_result.success}\n"
@@ -764,6 +1001,8 @@ __all__ = [
     "build_context",
     "build_coder_context",
     "apply_patch",
+    "apply_patch_detailed",
+    "apply_edits_to_text",
     "compute_diff",
     "rollback",
 ]
