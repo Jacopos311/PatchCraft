@@ -23,11 +23,23 @@ PatchCraft then runs its goal-driven loop: **diagnose → patch → test →
 self-correct**, showing live progress (stage · iteration · tokens vs budget ·
 last test verdict). When tests pass you get the final report and PR-ready diff.
 
+* Take it further: open a **pull request** (opt-in, no side effects by default).
+
+```bash
+patchcraft fix --push https://github.com/owner/repo/issues/123 ./local-repo
+```
+
+This pushes the `patchcraft/123-...` branch to `origin` and opens (or updates,
+idempotently) a **draft** pull request — the body references the issue with a
+hidden marker so re-runs never create duplicates. Drafts stay drafts until the
+evaluation milestone proves the pipeline reliable; set `pr.draft: false` in
+`.patchcraft.yml` to opt out.
+
 ### All commands
 
 | Command | Purpose |
 |---|---|
-| `patchcraft fix [-r OWNER/REPO] ISSUE LOCAL_REPO_PATH` | Fetch one GitHub issue (URL or number) and solve it headlessly. **The recommended entry point.** |
+| `patchcraft fix [-r OWNER/REPO] ISSUE LOCAL_REPO_PATH` | Fetch one GitHub issue (URL or number) and solve it headlessly. `--push` also opens/updates a draft pull request. **The recommended entry point.** |
 | `patchcraft run REPO_PATH "ISSUE TEXT"` | Solve a locally described issue. |
 | `patchcraft select GITHUB_REPO LOCAL_REPO_PATH` | Browse open issues interactively and pick one (`--yes` = solve the first automatically). |
 | `patchcraft ask "PROMPT"` | One-shot LLM query with automatic fallback. |

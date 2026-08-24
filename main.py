@@ -406,6 +406,11 @@ def select(
 @click.option("--allow-dirty", "allow_dirty", is_flag=True, default=False,
               show_default=True,
               help="Allow running even if the git working tree is not clean.")
+@click.option("--push", "push_to_github", is_flag=True, default=False,
+              show_default=True,
+              help="After success: push the patchcraft/* branch to origin and "
+                   "open/update a pull request (draft per pr.draft, default "
+                   "true). Default is local-only.")
 @click.pass_obj
 def fix(
     obj: dict,
@@ -419,6 +424,7 @@ def fix(
     auto_install: bool,
     no_cache: bool,
     allow_dirty: bool,
+    push_to_github: bool,
 ) -> None:
     """Solve ISSUE_REF headlessly in LOCAL_REPO_PATH.
 
@@ -504,6 +510,44 @@ def fix(
         live_view.finish()
 
     _print_git_summary(result)
+
+    # -- Step 4.2: opt-in pull-request publishing ---------------------------
+    if push_to_github and result.success and result.git_branch:
+        if result.commit_sha is None:
+            CONSOLE.print("[yellow]--push skipped:[/] no commit was created.")
+        else:
+            report = result.report
+            pr_title = getattr(report, "title", None) or title or f"Fix issue #{number}"
+            pr_body = (
+                getattr(report, "pr_markdown", None)
+                or f"Automated PatchCraft fix.\n\nFiles changed:\n"
+                + "\n".join(f"- {f}" for f in result.files_changed)
+            )
+            try:
+                from src.github.pr_publisher import publish_pr
+
+                with CONSOLE.status("Publishing pull request ..."):
+                    pr_url = publish_pr(
+                        repo=repo,
+                        repo_path=local_repo_path,
+                        branch=result.git_branch,
+                        title=pr_title,
+                        body=pr_body,
+                        draft=cfg.pr.draft,
+                        issue_number=number,
+                    )
+            except (GitHubAPIError, GitSafetyError) as exc:
+                CONSOLE.print(Panel(
+                    str(exc),
+                    title="[bold red]Publishing failed[/]",
+                    border_style="red",
+                ))
+                raise SystemExit(EXIT_CONFIG_ERROR) from exc
+            CONSOLE.print(Panel(
+                f"[bold]{pr_url}[/]",
+                title="[bold green]🔗 Pull Request ready[/]",
+                border_style="green",
+            ))
 
     if not result.success:
         if result.halt_reason:

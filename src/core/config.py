@@ -62,9 +62,11 @@ class TestConfig(BaseModel):
 
 
 class PRConfig(BaseModel):
-    """Pull-request preferences (consumed by the Milestone 4 git flow)."""
+    """Pull-request preferences."""
 
-    draft: bool = Field(default=False, description="Open pull requests as drafts.")
+    # Default TRUE per Step 4.2: every published PR is a draft until the
+    # evaluation/safety milestone (M5) proves the pipeline reliable enough.
+    draft: bool = Field(default=True, description="Open pull requests as drafts.")
 
 
 class PatchcraftConfig(BaseModel):
