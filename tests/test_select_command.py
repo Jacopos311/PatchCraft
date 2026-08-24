@@ -50,7 +50,7 @@ def test_select_empty_issues_exits() -> None:
 
 
 def test_select_github_error_exits() -> None:
-    """GitHubAPIError → panel di errore e SystemExit(1)."""
+    """GitHubAPIError → panel di errore e SystemExit(2) (config error, Step 3.3)."""
     from src.github.issue_fetcher import GitHubAPIError
 
     with mock.patch(
@@ -59,5 +59,5 @@ def test_select_github_error_exits() -> None:
     ):
         result = CliRunner().invoke(cli, ["select", "owner/repo", "./local"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "not found" in result.output

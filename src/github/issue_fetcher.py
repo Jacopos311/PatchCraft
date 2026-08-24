@@ -127,4 +127,45 @@ def get_open_issues(
     return [dict(item) for item in issues[:limit]]
 
 
-__all__ = ["get_open_issues", "GitHubAPIError"]
+def get_issue(repo_name: str, number: int) -> Dict[str, Any]:
+    """Fetch a SINGLE issue by number for ``repo_name`` (owner/repo).
+
+    Returns the GitHub API issue dict (``number``, ``title``, ``body``,
+    ``html_url``). Raises :class:`GitHubAPIError` for network/HTTP problems
+    or when the reference points to a Pull Request instead of an issue.
+    """
+    repo_name = _validate_repo_name(repo_name)
+    url = f"{GITHUB_API_URL}/repos/{repo_name}/issues/{int(number)}"
+    try:
+        response = requests.get(url, headers=_auth_headers(), timeout=TIMEOUT_SECONDS)
+    except requests.RequestException as exc:
+        raise GitHubAPIError(
+            f"Network error while fetching issue #{number} of '{repo_name}': {exc}"
+        ) from exc
+    if response.status_code == 404:
+        raise GitHubAPIError(f"Issue #{number} not found in '{repo_name}' (404).")
+    if response.status_code == 403:
+        raise GitHubAPIError(
+            "GitHub rate limit exceeded (403). "
+            "Set GITHUB_TOKEN/GH_TOKEN to raise the limit."
+        )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise GitHubAPIError(
+            f"The GitHub API responded with HTTP {response.status_code} "
+            f"for issue #{number} of '{repo_name}'."
+        ) from exc
+    issue = response.json()
+    if not isinstance(issue, dict):
+        raise GitHubAPIError(
+            f"Unexpected response shape for issue #{number} of '{repo_name}'."
+        )
+    if "pull_request" in issue:
+        raise GitHubAPIError(
+            f"#{number} is a pull request, not an issue: PatchCraft only solves issues."
+        )
+    return issue
+
+
+__all__ = ["get_open_issues", "get_issue", "GitHubAPIError"]

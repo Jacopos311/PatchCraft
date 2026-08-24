@@ -24,7 +24,8 @@ import logging
 import os
 import re
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterator, Optional, Union
+from typing import Callable, Iterator, Optional, Sequence, Union
+
 
 from pydantic import BaseModel, Field
 
@@ -314,14 +315,47 @@ class RepoIndex:
     # Building
     # ------------------------------------------------------------------
     @staticmethod
-    def _iter_source_files(root: Path) -> Iterator[Path]:
+    def _matches_ignore_globs(rel_posix: str, globs: Sequence[str]) -> bool:
+        """Whether a repo-relative posix path matches any ignore glob.
+
+        A pattern matches the full path or any single path component
+        (so ``build`` ignores ``build/`` directories and ``vendor/**`` trees).
+        """
+        from fnmatch import fnmatch
+
+        parts = rel_posix.split("/")
+        return any(
+            fnmatch(rel_posix, pattern) or any(fnmatch(part, pattern) for part in parts)
+            for pattern in globs
+        )
+
+    @classmethod
+    def _iter_source_files(
+        cls, root: Path, ignore_globs: Sequence[str] = ()
+    ) -> Iterator[Path]:
         for dirpath, dirnames, filenames in os.walk(root, topdown=True):
             dirnames[:] = [
                 d for d in dirnames
                 if d not in IGNORED_DIR_NAMES and not d.startswith(".")
             ]
             for name in sorted(filenames):
-                yield Path(dirpath) / name
+                path = Path(dirpath) / name
+                if ignore_globs:
+                    rel = path.relative_to(root).as_posix()
+                    if cls._matches_ignore_globs(rel, ignore_globs):
+                        continue
+                yield path
+
+    @classmethod
+    def _configured_ignore_globs(cls, root: Path) -> list[str]:
+        """``ignore_globs`` from ``<root>/.patchcraft.yml`` (defensive)."""
+        try:
+            from src.core.config import load_config
+
+            return list(load_config(root).ignore_globs)
+        except Exception as exc:  # noqa: BLE001 - config must never break indexing
+            logger.debug("Ignore globs unavailable (%s: %s).", type(exc).__name__, exc)
+            return []
 
     @staticmethod
     def _hash_bytes(data: bytes) -> str:
@@ -370,17 +404,29 @@ class RepoIndex:
         return [f"{joined}.py", f"{joined}/__init__.py"]
 
     @classmethod
-    def build(cls, repo_root: Union[str, Path], force: bool = False) -> "RepoIndex":
+    def build(
+        cls,
+        repo_root: Union[str, Path],
+        force: bool = False,
+        ignore_globs: Optional[Sequence[str]] = None,
+    ) -> "RepoIndex":
         """Build (or incrementally refresh) the index of ``repo_root``.
 
         Unchanged files (same content hash) reuse their cached symbols and
         imports, so a warm rebuild only re-parses what actually changed.
         Import statements are resolved to repo-relative file paths in a
         second pass, once the full file set is known.
+
+        ``ignore_globs`` (Step 3.3) excludes matching paths from the index;
+        when ``None`` the patterns are read from ``<repo>/.patchcraft.yml``
+        (``ignore_globs`` key), defaulting to no extra exclusions.
         """
         root = Path(repo_root).expanduser().resolve()
         if not root.is_dir():
             raise NotADirectoryError(f"Repository does not exist: {root}")
+
+        if ignore_globs is None:
+            ignore_globs = cls._configured_ignore_globs(root)
 
         cached: dict[str, FileEntry] = {}
         if not force:
@@ -388,7 +434,7 @@ class RepoIndex:
 
         files: dict[str, FileEntry] = {}
         pending_imports: dict[str, list[tuple[int, str]]] = {}
-        for path in cls._iter_source_files(root):
+        for path in cls._iter_source_files(root, ignore_globs):
             suffix = path.suffix.lower()
             if suffix not in PYTHON_EXTENSIONS and suffix not in JS_EXTENSIONS:
                 continue

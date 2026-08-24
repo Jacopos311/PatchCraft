@@ -44,7 +44,25 @@ from src.agents.coder import (
 )
 from src.agents.diagnostic import diagnose
 from src.agents.reporter import PatchReport, generate_report
-from src.sandbox.runner import SandboxRunner
+from src.sandbox.runner import SandboxRunner, TestResult
+from src.sandbox.failures import extract_failures, format_failure_report
+from src.core.cache import (
+    TestResultCache,
+    configure_memo_cache,
+    get_memo_cache,
+)
+from src.core.runstats import begin_run
+from src.core.gitflow import (
+    GitFlow,
+    GitSafetyError,
+    build_branch_name,
+    build_commit_message,
+    detect_commit_style,
+    get_recent_subjects,
+    pop_worktree_cleanup,
+    register_worktree_cleanup,
+)
+
 
 # Lazy-imported targeted test selection (Step 2.1) — see _select_test_targets().
 from src.core.targeted_tests import (
@@ -66,6 +84,11 @@ SOURCE_EXTENSIONS = {
     ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".yaml", ".yml",
     ".mjs", ".cjs", ".go", ".rs", ".java", ".c", ".h", ".cpp", ".hpp", ".sh",
 }
+
+# Maximum characters of raw test output appended to the corrector feedback
+# after the structured failure report (Step 2.2): structured data leads,
+# raw output stays available as fallback without flooding the prompt.
+RAW_FEEDBACK_TAIL_CHARS = 4000
 
 IGNORED_DIR_PARTS = {
     ".git", ".hg", ".svn", "node_modules", "__pycache__",
@@ -90,6 +113,17 @@ class RunResult(BaseModel):
             "Human-readable reason the loop stopped without success "
             "(retry limit, stagnation, token/time budget or credit floor)."
         ),
+    )
+    git_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "patchcraft/* branch holding the result when the target repo is "
+            "a git repository (Step 4.1). None on failure or non-git repos."
+        ),
+    )
+    commit_sha: Optional[str] = Field(
+        default=None,
+        description="SHA of the commit created on git_branch (Step 4.1).",
     )
 
 
@@ -151,6 +185,35 @@ def _env_optional(name: str, cast: Callable[[str], object]) -> Optional[object]:
     except ValueError:
         logger.warning("Invalid value for %s: %r — ignored.", name, raw)
         return None
+
+
+def _retrieval_k_for(repo_root: Path) -> int:
+    """BM25 retrieval width for ``repo_root`` (Step 3.3).
+
+    Precedence: ``PATCHCRAFT_RETRIEVAL_K`` env > ``retrieval_k`` in
+    ``<repo>/.patchcraft.yml`` > built-in default. Invalid values always
+    degrade gracefully to the built-in default.
+    """
+    from src.core.retrieval import DEFAULT_RETRIEVAL_K
+
+    raw_env = os.getenv("PATCHCRAFT_RETRIEVAL_K")
+    if raw_env and raw_env.strip():
+        try:
+            return max(1, int(raw_env))
+        except ValueError:
+            logger.warning(
+                "Invalid PATCHCRAFT_RETRIEVAL_K=%r — using default %d.",
+                raw_env, DEFAULT_RETRIEVAL_K,
+            )
+            return DEFAULT_RETRIEVAL_K
+    try:
+        from src.core.config import load_config
+
+        configured = load_config(repo_root).retrieval_k
+    except Exception as exc:  # noqa: BLE001 - config must never break context
+        logger.debug("Retrieval config unavailable (%s: %s).", type(exc).__name__, exc)
+        return DEFAULT_RETRIEVAL_K
+    return configured if configured is not None else DEFAULT_RETRIEVAL_K
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +317,9 @@ def build_context(repo_root: Path, issue_description: str, max_tokens: Optional[
     sources = _discover_source_files(repo_root)
     if repo_index_obj is not None and sources:
         try:
-            from src.core.retrieval import DEFAULT_RETRIEVAL_K, select_files
+            from src.core.retrieval import select_files
 
-            k = _prompt_budget("PATCHCRAFT_RETRIEVAL_K", DEFAULT_RETRIEVAL_K)
+            k = _retrieval_k_for(repo_root)
             retrieved = [
                 repo_root / rel
                 for rel in select_files(issue_description, repo_index_obj, k=k)
@@ -533,24 +596,113 @@ def rollback(repo_root: Path, snapshots: dict[Path, Optional[str]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Targeted test execution (Step 2.1)
+# Structured correction feedback (Step 2.2)
 # ---------------------------------------------------------------------------
+def _build_correction_feedback(test_result) -> str:
+    """Build the self-corrector feedback for a failed test run.
+
+    Priority (Step 2.2):
+    1. Missing-dependency warning when the environment, not the patch, broke.
+    2. Structured failure report (pytest/Jest/Vitest parsing) — small and
+       actionable.
+    3. Raw stdout/stderr TAIL as fallback/context (truncated so huge dumps do
+       not flood the prompt).
+    """
+    parts: list[str] = []
+
+    missing = getattr(test_result, "missing_dependency", None)
+    if missing:
+        parts.append(
+            "MISSING DEPENDENCY DETECTED (environment problem, not a code "
+            f"bug):\n{missing}\n"
+            "These tests cannot pass until the dependency/import issue is "
+            "resolved; do not try to fix it by changing unrelated code."
+        )
+
+    failures = extract_failures(test_result)
+    if failures:
+        report = format_failure_report(failures)
+        parts.append(
+            f"STRUCTURED FAILURE REPORT ({len(failures)} failing test(s)):\n{report}"
+        )
+
+    raw_parts: list[str] = []
+    if test_result.stdout:
+        raw_parts.append("--- stdout ---\n" + test_result.stdout[-RAW_FEEDBACK_TAIL_CHARS:])
+    if test_result.stderr:
+        raw_parts.append("--- stderr ---\n" + test_result.stderr[-RAW_FEEDBACK_TAIL_CHARS:])
+    if raw_parts:
+        parts.append("RAW OUTPUT (tail):\n" + "\n".join(raw_parts))
+
+    if not parts:
+        parts.append(f"(no output; exit code {test_result.exit_code})")
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Targeted test execution (Step 2.1) + targeted verdict cache (Step 3.1)
+# ---------------------------------------------------------------------------
+# Maximum output tail stored per cached targeted verdict, so a huge failure
+# dump cannot bloat .patchcraft/cache/test_results/.
+_CACHED_OUTPUT_TAIL_CHARS = 20_000
+
+
+def _cacheable_test_result(result: object) -> bool:
+    """Whether a test verdict is stable enough to be cached (Step 3.1).
+
+    Missing-dependency failures depend on the machine environment and
+    timeouts (exit code 124) depend on machine load — neither is a property
+    of the patch itself, so both are never cached.
+    """
+    if getattr(result, "missing_dependency", None) is not None:
+        return False
+    return getattr(result, "exit_code", 1) != 124
+
+
+def _patch_fingerprint(repo_root: Path, snapshots: dict[Path, Optional[str]]) -> str:
+    """Stable fingerprint of the post-patch state of every touched file.
+
+    Hashes each touched file's CURRENT content (not the patch text), so the
+    fingerprint is identical no matter whether the change arrived as a
+    surgical edit or as a whole-file rewrite. Used by the targeted-test
+    result cache: same fingerprint + same subset => same verdict.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(snapshots):
+        rel = path.relative_to(repo_root).as_posix().replace("\\\\", "/")
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\x00")
+        digest.update(
+            hashlib.sha256(content.encode("utf-8", "replace")).hexdigest().encode("ascii")
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _run_tests_or_fallback(
     runner: SandboxRunner,
     repo_root: Path,
     changed_files: list[str],
     selection,
     emit: Callable[[str, str], None],
+    result_cache: Optional[TestResultCache] = None,
+    patch_fingerprint: Optional[str] = None,
 ):
     """Run targeted tests when available; fall back to the full suite.
 
     Two-phase strategy:
     1. If targeted tests were found for the changed files, run them first.
        A failure here is definitive (the patch broke something specific) and
-       saves a full-suite run.
+       saves a full-suite run. When the EXACT same patch (post-patch
+       fingerprint) is re-proposed for the exact same subset, the previous
+       verdict is reused from ``result_cache`` instead of re-executing.
     2. Only when targeted tests pass, run the FULL suite as the final gate —
        this catches regressions in unrelated code that the import graph
-       couldn't predict.
+       couldn't predict. The gate NEVER uses the cache.
 
     Returns the final :class:`TestResult` (always from the full suite when
     targeted passed, from targeted when they failed, or from the full suite
@@ -558,9 +710,47 @@ def _run_tests_or_fallback(
     """
     if selection is not None and selection.has_targets:
         targets = selection.node_ids
+
+        # -- Step 3.1: reuse the cached verdict for an identical patch -----
+        cache_key: Optional[str] = None
+        if (
+            result_cache is not None
+            and result_cache.enabled
+            and patch_fingerprint
+        ):
+            cache_key = result_cache.make_key(patch_fingerprint, targets)
+            cached_verdict = result_cache.lookup(cache_key)
+            if cached_verdict is not None:
+                console.print(
+                    "[cyan]♻ Cached targeted verdict reused "
+                    "(identical patch + test subset).[/]"
+                )
+                emit(
+                    "test",
+                    "Targeted run skipped: cached verdict reused for the "
+                    "identical patch and test subset.",
+                )
+                return TestResult(
+                    success=bool(cached_verdict.get("success")),
+                    stdout=str(cached_verdict.get("stdout", "")),
+                    stderr=str(cached_verdict.get("stderr", "")),
+                    exit_code=int(cached_verdict.get("exit_code", 1)),
+                    subset="targeted",
+                    cached=True,
+                )
+
         emit("test", f"Running {len(targets)} targeted test file(s): {', '.join(targets)}")
         console.print(f"[cyan]🎯 Targeted tests:[/] {len(targets)} file(s)")
         targeted_result = runner.run_tests(targets=targets)
+
+        if cache_key is not None and _cacheable_test_result(targeted_result):
+            result_cache.store(  # type: ignore[union-attr]
+                cache_key,
+                success=targeted_result.success,
+                exit_code=targeted_result.exit_code,
+                stdout=(targeted_result.stdout or "")[-_CACHED_OUTPUT_TAIL_CHARS:],
+                stderr=(targeted_result.stderr or "")[-_CACHED_OUTPUT_TAIL_CHARS:],
+            )
 
         if not targeted_result.success:
             console.print("[bold red]❌ Targeted tests failed — skipping full suite.[/]")
@@ -597,6 +787,65 @@ def run_patchcraft_loop(
     token_budget: Optional[int] = None,
     time_budget_seconds: Optional[float] = None,
     min_remaining_credits: Optional[float] = None,
+    auto_install: bool = False,
+    use_cache: bool = True,
+    issue_number: Optional[int] = None,
+    issue_title: Optional[str] = None,
+    allow_dirty: bool = False,
+) -> RunResult:
+    """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
+
+    Thin wrapper that scopes the process-wide caching configuration
+    (Step 3.1) to THIS run only: whatever memo-cache settings existed before
+    the call are restored afterwards, so long-lived processes (GUI, test
+    suites) never inherit stale cache state. See
+    :func:`_run_patchcraft_loop_impl` for the full documentation.
+    """
+    memo = get_memo_cache()
+    saved_enabled, saved_base_dir = memo.enabled, memo.base_dir
+    try:
+        return _run_patchcraft_loop_impl(
+            repo_path=repo_path,
+            issue_description=issue_description,
+            model=model,
+            max_retries=max_retries,
+            event_sink=event_sink,
+            token_budget=token_budget,
+            time_budget_seconds=time_budget_seconds,
+            min_remaining_credits=min_remaining_credits,
+            auto_install=auto_install,
+            use_cache=use_cache,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            allow_dirty=allow_dirty,
+        )
+    finally:
+        memo.enabled, memo.base_dir = saved_enabled, saved_base_dir
+        # Step 4.1 safety net: if the pipeline crashed without consuming its
+        # worktree cleanup, run it now with failure semantics.
+        crash_cleanup = pop_worktree_cleanup()
+        if crash_cleanup is not None:
+            try:
+                crash_cleanup()
+                logger.warning("Pending git worktree cleaned up after a crash.")
+            except Exception as exc:  # noqa: BLE001 - best effort
+                logger.warning("Crash cleanup of the git worktree failed: %s", exc)
+
+
+def _run_patchcraft_loop_impl(
+    repo_path: str,
+    issue_description: str,
+    model: str,
+    max_retries: Optional[int] = None,
+    event_sink: Optional[Callable[[str, str], None]] = None,
+    token_budget: Optional[int] = None,
+    time_budget_seconds: Optional[float] = None,
+    min_remaining_credits: Optional[float] = None,
+    auto_install: bool = False,
+    use_cache: bool = True,
+    issue_number: Optional[int] = None,
+    issue_title: Optional[str] = None,
+    allow_dirty: bool = False,
 ) -> RunResult:
     """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
 
@@ -630,6 +879,16 @@ def run_patchcraft_loop(
         Halt when the OpenRouter remaining credit balance drops below this
         value. ``None`` disables the check; falls back to
         ``PATCHCRAFT_MIN_CREDITS``.
+    auto_install : bool
+        When True, a failed test run showing a missing-dependency error
+        triggers ONE dependency install + retry in the sandbox (default off;
+        see :class:`src.sandbox.runner.SandboxRunner`).
+    use_cache : bool
+        Enable the caching layer (Roadmap Step 3.1): the LLM memo cache and
+        the targeted-test verdict cache, both scoped to
+        ``<repo>/.patchcraft/cache``. ``False`` disables both for this run
+        (equivalent to the CLI ``--no-cache`` flag). The environment variable
+        ``PATCHCRAFT_NO_CACHE=1`` always wins.
 
     Returns
     -------
@@ -653,6 +912,33 @@ def run_patchcraft_loop(
     if not issue_description.strip():
         raise ValueError("issue_description must not be empty.")
 
+    # -- Step 4.1: safe git workflow ---------------------------------------
+    # Git repos get an isolated worktree on a patchcraft/* branch; the
+    # user's checkout is never touched. Non-git repos keep today's behavior.
+    main_repo_root = repo_root  # caches stay anchored to the user's checkout
+    git_flow: Optional[GitFlow] = None
+    worktree_path: Optional[Path] = None
+    git_branch: Optional[str] = None
+    if GitFlow.is_git_repo(repo_root):
+        git_flow = GitFlow(repo_root)
+        git_flow.ensure_ready(allow_dirty=allow_dirty)  # raises GitSafetyError
+        git_branch = build_branch_name(issue_number, issue_title)
+        worktree_path = git_flow.create_worktree(git_branch)
+        register_worktree_cleanup(
+            lambda wt=worktree_path, br=git_branch: git_flow.cleanup(wt, True, br)
+        )
+        repo_root = worktree_path
+        console.print(f"[bold]Git branch:[/] {git_branch} (isolated worktree)")
+
+    # -- Step 3.1: caching layer (LLM memo + targeted-test verdicts) -------
+    # Both caches live under <repo>/.patchcraft/cache of the USER'S checkout;
+    # PATCHCRAFT_NO_CACHE always disables them regardless of use_cache.
+    configure_memo_cache(
+        enabled=use_cache,
+        base_dir=main_repo_root / ".patchcraft" / "cache",
+    )
+    test_result_cache = TestResultCache(main_repo_root, enabled=use_cache)
+
     # Guardrail defaults from the environment (explicit arguments win).
     if token_budget is None:
         token_budget = _env_optional("PATCHCRAFT_TOKEN_BUDGET", int)
@@ -673,9 +959,15 @@ def run_patchcraft_loop(
     started_at = time.monotonic()
     usage: dict[str, int] = {"prompt": 0, "completion": 0}
 
+    # Step 3.2: mirror token accounting into the shared run-stats registry
+    # so live views can show "tokens spent vs budget". Pure instrumentation:
+    # pipeline behavior and budgets are computed from `usage` as before.
+    run_stats = begin_run()
+
     def usage_sink(prompt_tokens: int, completion_tokens: int) -> None:
         usage["prompt"] += prompt_tokens
         usage["completion"] += completion_tokens
+        run_stats.add(prompt_tokens, completion_tokens)
 
     with console.status("📖 Reading documentation and sources ..."):
         context = build_context(repo_root, issue_description)
@@ -845,7 +1137,7 @@ def run_patchcraft_loop(
 
         console.rule("[bold cyan]🧪 Running tests")
         with console.status("Running tests ..."):
-            runner = SandboxRunner(repo_root)
+            runner = SandboxRunner(repo_root, auto_install=auto_install)
 
             # -- Step 2.1: Targeted test selection -----------------------
             changed = [str(p.relative_to(repo_root).as_posix())
@@ -857,8 +1149,15 @@ def run_patchcraft_loop(
                 except Exception as exc:
                     logger.debug("Targeted test selection skipped (%s).", exc)
 
+            # -- Step 3.1: targeted verdict cache (identical patch reuse) --
+            patch_fp = (
+                _patch_fingerprint(repo_root, new_snapshots)
+                if new_snapshots else None
+            )
             test_result = _run_tests_or_fallback(
-                runner, repo_root, changed, selection, emit
+                runner, repo_root, changed, selection, emit,
+                result_cache=test_result_cache,
+                patch_fingerprint=patch_fp,
             )
         emit(
             "test",
@@ -887,26 +1186,50 @@ def run_patchcraft_loop(
                     border_style="green",
                 ))
             emit("done", "Pipeline completed successfully.")
+
+            # -- Step 4.1: commit ONLY the touched files on the branch ------
+            commit_sha: Optional[str] = None
+            if git_flow is not None and worktree_path is not None:
+                style = detect_commit_style(get_recent_subjects(main_repo_root))
+                summary = issue_title or issue_description.splitlines()[0]
+                message = build_commit_message(style, summary, issue_number)
+                commit_sha = git_flow.commit_touched(
+                    worktree_path, files_changed, message
+                )
+                # Worktree removed; branch + commit are kept as deliverable.
+                git_flow.cleanup(worktree_path, delete_branch=False, branch=git_branch)
+                pop_worktree_cleanup()  # consumed: no crash-cleanup needed
+                worktree_path = None
+                console.print(
+                    f"[green]Committed on branch[/] [bold]{git_branch}[/]"
+                    + (f" ([dim]{commit_sha[:10]}[/])" if commit_sha else " (no changes)")
+                )
+
             return RunResult(
                 success=True,
                 iterations=attempt,
                 report=report if isinstance(report, PatchReport) else None,
                 test_errors=test_errors,
                 files_changed=files_changed,
+                git_branch=git_branch if git_flow is not None else None,
+                commit_sha=commit_sha,
             )
 
-        console.print("[bold red]❌ Tests failed — stdout+stderr passed to the self-corrector.[/]")
-        # Jest/Vitest print failed-test details on stdout: the feedback for
-        # the self-corrector includes both stdout and stderr.
-        feedback_parts: list[str] = []
-        if test_result.stdout:
-            feedback_parts.append(f"--- stdout ---\n{test_result.stdout}")
-        if test_result.stderr:
-            feedback_parts.append(f"--- stderr ---\n{test_result.stderr}")
-        if not feedback_parts:
-            feedback_parts.append(f"(no output; exit code {test_result.exit_code})")
-        test_errors.append("\n\n".join(feedback_parts))
-        emit("error", "\n\n".join(feedback_parts))
+        console.print("[bold red]❌ Tests failed — structured feedback passed to the self-corrector.[/]")
+        if test_result.missing_dependency:
+            console.print(
+                f"[yellow]⚠ Missing dependency detected:[/] {test_result.missing_dependency}"
+            )
+        if failures_extracted := extract_failures(test_result):
+            console.print(
+                f"[cyan]🔎 Structured failure report:[/] {len(failures_extracted)} "
+                "failing test(s) parsed."
+            )
+        # Step 2.2: structured report first (small + actionable), raw output
+        # tail as fallback — Jest/Vitest print details on stdout.
+        feedback = _build_correction_feedback(test_result)
+        test_errors.append(feedback)
+        emit("error", feedback)
 
         # -- Guardrail: loop detection ----------------------------------------
         patch_json = current_patch.model_dump_json() if isinstance(current_patch, Patch) else None
@@ -915,6 +1238,13 @@ def run_patchcraft_loop(
 
     # A guardrail stopped the loop: roll back and fail with a clear report.
     rollback(repo_root, original_snapshots)
+    # Step 4.1: on failure the worktree AND the branch are removed; HEAD of
+    # the user's checkout was never touched.
+    if git_flow is not None and worktree_path is not None:
+        git_flow.cleanup(worktree_path, delete_branch=True, branch=git_branch)
+        pop_worktree_cleanup()
+        worktree_path = None
+        console.print("[yellow]Git worktree removed and branch deleted.[/]")
     reason = halt_reason or "The loop stopped without converging."
     tokens_summary = usage["prompt"] + usage["completion"]
     console.print(Panel(

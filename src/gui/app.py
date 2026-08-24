@@ -36,7 +36,9 @@ from textual.widgets import (
     TextArea,
 )
 
+from src.gui.live_panel import RunState
 from src.gui.pipeline import PipelineEvent, credits_snapshot, format_credits_line, run_pipeline
+
 
 CREDITS_PLACEHOLDER = "[dim]💳 OpenRouter credits…[/dim]"
 DEFAULT_ISSUE_PROMPT = "Select an issue…"
@@ -58,6 +60,7 @@ class PatchCraftApp(App[None]):
     #status-line { height: 3; content-align: center middle; border: round $accent; margin-bottom: 1; }
     #status-line.pass { border: round $success; }
     #status-line.fail { border: round $error; }
+    #pipeline-status { height: 1; padding: 0 1; color: $accent; margin-bottom: 1; }
     RichLog, TextArea { height: 1fr; }
     """
 
@@ -73,6 +76,8 @@ class PatchCraftApp(App[None]):
         self.load_credits_on_mount = load_credits_on_mount
         self._issues: list[dict] = []
         self._running = False
+        # Step 3.2: mirrors stage/iteration/tokens/verdict in the footer line.
+        self._run_state: Optional[RunState] = None
 
     # ------------------------------------------------------------------
     # Layout
@@ -93,6 +98,7 @@ class PatchCraftApp(App[None]):
                 yield Button("▶  Start pipeline", id="start", variant="primary")
             with Vertical(id="main"):
                 yield Static("Ready.", id="status-line")
+                yield Static("", id="pipeline-status")
                 with TabbedContent(initial="log-tab"):
                     with TabPane("Agent log", id="log-tab"):
                         yield RichLog(id="log", highlight=False, markup=False, wrap=True)
@@ -136,6 +142,18 @@ class PatchCraftApp(App[None]):
             "done": "🏁",
         }.get(stage, "•")
         log.write(f"{tag} [{stage}] {message}")
+
+    def _update_pipeline_status(self, stage: str, message: str) -> None:
+        """Step 3.2: mirror the run state into the compact footer line."""
+        if self._run_state is None:
+            self._run_state = RunState()
+        try:
+            self._run_state.observe(stage, message)
+            self.query_one("#pipeline-status", Static).update(
+                self._run_state.summary_line()
+            )
+        except Exception:  # noqa: BLE001 - presentation must never break the UI
+            pass
 
 # ------------------------------------------------------------------
     # Credits widget (background thread → call_from_thread)
@@ -221,6 +239,7 @@ class PatchCraftApp(App[None]):
 
     def _handle_event(self, event: PipelineEvent) -> None:
         self._append_log(event.stage, event.message)
+        self._update_pipeline_status(event.stage, event.message)
         if event.stage == "test":
             first = event.message.splitlines()[0] if event.message else ""
             if "success=True" in first:
@@ -294,6 +313,12 @@ class PatchCraftApp(App[None]):
         self.query_one("#start", Button).disabled = True
         log = self.query_one("#log", RichLog)
         log.clear()
+        # Step 3.2: fresh status footer for the new run.
+        self._run_state = RunState()
+        try:
+            self.query_one("#pipeline-status", Static).update(self._run_state.summary_line())
+        except Exception:  # noqa: BLE001 - widget may not exist in odd test setups
+            pass
         self.query_one(TabbedContent).active = "log-tab"
         self._set_status("Pipeline running…", state=None)
         self._run_pipeline_worker(repo_path, issue_description, self.default_model, self.max_retries)

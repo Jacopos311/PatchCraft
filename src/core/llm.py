@@ -29,6 +29,8 @@ from litellm.exceptions import (
 )
 from pydantic import BaseModel
 
+from src.core.cache import get_memo_cache
+
 logger = logging.getLogger(__name__)
 
 # Drop unsupported parameters instead of raising exceptions that would
@@ -144,6 +146,28 @@ def build_fallback_chain(provider_model: str) -> list[str]:
         if default_model not in chain:
             chain.append(default_model)
     return chain
+
+
+# ---------------------------------------------------------------------------
+# Process-wide fallback-chain override (Roadmap Step 3.3, `fallback_models`)
+# ---------------------------------------------------------------------------
+_default_fallback_chain: Optional[tuple[str, ...]] = None
+
+
+def set_default_fallback_chain(models: Optional[Sequence[str]]) -> None:
+    """Override the automatic fallback chain process-wide.
+
+    Used by the CLI to apply ``fallback_models`` from ``.patchcraft.yml``.
+    Pass ``None``/empty to restore the automatic canonical chain.
+    """
+    global _default_fallback_chain
+    cleaned = tuple(m.strip() for m in (models or []) if m and m.strip())
+    _default_fallback_chain = cleaned or None
+
+
+def get_default_fallback_chain() -> Optional[tuple[str, ...]]:
+    """Currently configured override chain, or ``None`` when automatic."""
+    return _default_fallback_chain
 
 
 def _build_messages(
@@ -284,6 +308,7 @@ def call_llm(
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
     usage_sink: Optional[Callable[[int, int], None]] = None,
+    use_cache: Optional[bool] = None,
 ) -> str: ...
 
 
@@ -300,7 +325,9 @@ def call_llm(
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
     usage_sink: Optional[Callable[[int, int], None]] = None,
+    use_cache: Optional[bool] = None,
 ) -> BaseModel: ...
+
 
 
 def call_llm(
@@ -315,6 +342,7 @@ def call_llm(
     fallback_chain: Optional[Sequence[str]] = None,
     max_tokens: Optional[int] = None,
     usage_sink: Optional[Callable[[int, int], None]] = None,
+    use_cache: Optional[bool] = None,
 ) -> Union[str, BaseModel]:
     """Query the LLM with automatic cross-model fallback.
 
@@ -344,7 +372,13 @@ def call_llm(
         Optional callback invoked as ``usage_sink(prompt_tokens,
         completion_tokens)`` after every successful completion, so callers
         can enforce per-task token budgets. Never raises into the loop:
-        sink exceptions are swallowed and logged.
+        sink exceptions are swallowed and logged. NOT invoked for memo-cache
+        hits (a cached response costs zero tokens).
+    use_cache : bool | None
+        Per-call override of the LLM memo cache (Step 3.1). ``None`` (the
+        default) follows the process-wide configuration (see
+        :func:`src.core.cache.configure_memo_cache` and the
+        ``PATCHCRAFT_NO_CACHE`` environment variable).
 
     Returns
     -------
@@ -355,9 +389,57 @@ def call_llm(
     ------
     ``MaxRetriesExceeded`` when every model in the fallback chain fails.
     """
-    chain = list(fallback_chain) if fallback_chain else build_fallback_chain(provider_model)
+    if fallback_chain:
+        chain = list(fallback_chain)
+    elif _default_fallback_chain:
+        # Configured chain (Step 3.3): the requested model is always tried
+        # first, then the configured order, deduplicated.
+        seen: set[str] = set()
+        chain = []
+        for candidate in (provider_model, *_default_fallback_chain):
+            stripped = candidate.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                chain.append(stripped)
+    else:
+        chain = build_fallback_chain(provider_model)
     messages = _build_messages(system_prompt, user_prompt, json_schema)
     logger.debug("[patchcraft.llm] fallback chain: %s", chain)
+
+    # -- Step 3.1: LLM memo cache --------------------------------------
+    # Identical (account, model, messages, schema, max_tokens) calls reuse
+    # the earlier response instead of hitting the network again. The entry
+    # is stored only AFTER the response validates, so a corrupt or unusable
+    # cached payload degrades gracefully to a normal cache miss.
+    memo = get_memo_cache()
+    caching_enabled = memo.enabled if use_cache is None else bool(use_cache)
+    cache_key: Optional[str] = None
+    if caching_enabled:
+        schema_json = (
+            json.dumps(json_schema.model_json_schema(), sort_keys=True)
+            if json_schema is not None
+            else None
+        )
+        cache_key = memo.make_key(
+            model=provider_model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            schema_json=schema_json,
+            max_tokens=max_tokens,
+        )
+        cached_content = memo.lookup(cache_key)
+        if cached_content is not None:
+            logger.info("[patchcraft.llm] memo-cache HIT (%s)", provider_model)
+            try:
+                if json_schema is None:
+                    return _as_text(cached_content)
+                return _coerce_to_model(cached_content, json_schema)
+            except Exception as exc:  # noqa: BLE001 - unusable entry == miss
+                logger.warning(
+                    "[patchcraft.llm] memo-cache entry unusable (%s: %s); "
+                    "falling through to a live call.",
+                    type(exc).__name__, exc,
+                )
 
     last_error: Optional[BaseException] = None
     for model in chain:
@@ -372,10 +454,16 @@ def call_llm(
                             usage_sink(prompt_toks, completion_toks)
                     except Exception as exc:  # noqa: BLE001 - sink must never break the loop
                         logger.warning("usage_sink raised: %s: %s", type(exc).__name__, exc)
-                content = _extract_content(response)
+                content = _as_text(_extract_content(response))
+                result: Union[str, BaseModel]
                 if json_schema is None:
-                    return _as_text(content)
-                return _coerce_to_model(content, json_schema)
+                    result = content
+                else:
+                    result = _coerce_to_model(content, json_schema)
+                # Only validated responses are cached.
+                if cache_key is not None:
+                    memo.store(cache_key, content)
+                return result
             except Exception as exc:  # noqa: BLE001 - any error triggers fallback
                 last_error = exc
                 logger.warning(
@@ -399,6 +487,8 @@ def call_llm(
 __all__ = [
     "call_llm",
     "build_fallback_chain",
+    "set_default_fallback_chain",
+    "get_default_fallback_chain",
     "LLMError",
     "LLMResponseError",
     "MaxRetriesExceeded",
