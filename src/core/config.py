@@ -101,6 +101,14 @@ class PatchcraftConfig(BaseModel):
         default="repo-derived",
         description="Commit message style for the git workflow (Milestone 4).",
     )
+    followup_max_iterations: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Hard cap on patch+test iterations for `patchcraft followup` "
+            "(review-response loop). Default 3 when unset."
+        ),
+    )
     test: TestConfig = Field(default_factory=TestConfig)
     pr: PRConfig = Field(default_factory=PRConfig)
 
@@ -119,7 +127,7 @@ _KNOWN_TOP_LEVEL_KEYS = frozenset(
     {
         "model", "fallback_models", "retrieval_k", "token_budget",
         "time_budget", "min_credits", "max_retries", "ignore_globs",
-        "commit_style", "test", "pr",
+        "commit_style", "followup_max_iterations", "test", "pr",
     }
 )
 

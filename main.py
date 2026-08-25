@@ -557,6 +557,107 @@ def fix(
         raise SystemExit(_halt_exit_code(result))
 
 
+@cli.command("followup")
+@click.argument("pr_url")
+@click.argument("local_repo_path")
+@click.option("--max-iterations", "max_iterations", default=None, type=int,
+              help="Hard cap on patch+test iterations (config key: "
+                   "followup_max_iterations; default 3).")
+@click.option("--token-budget", default=None, type=int,
+              help="Max total LLM tokens per task (env PATCHCRAFT_TOKEN_BUDGET).")
+@click.option("--time-budget", "time_budget", default=None, type=float,
+              help="Wall-clock budget in seconds per task (env PATCHCRAFT_TIME_BUDGET).")
+@click.option("--min-credits", "min_credits", default=None, type=float,
+              help="Halt if OpenRouter remaining credits drop below this value.")
+@click.option("--auto-install", "auto_install", is_flag=True, default=False,
+              show_default=True,
+              help="Install missing dependencies once and retry tests when a "
+                   "dependency error is detected (default off).")
+@click.option("--no-cache", "no_cache", is_flag=True, default=False,
+              show_default=True,
+              help="Disable the caching layer (env PATCHCRAFT_NO_CACHE).")
+@click.pass_obj
+def followup(
+    obj: dict,
+    pr_url: str,
+    local_repo_path: str,
+    max_iterations: int | None,
+    token_budget: int | None,
+    time_budget: float | None,
+    min_credits: float | None,
+    auto_install: bool,
+    no_cache: bool,
+) -> None:
+    """Address must-fix review comments on PR_URL, pushing to the SAME branch.
+
+    Fetches reviewer comments on the pull request, classifies them
+    (must-fix / nit / question), runs the self-correction loop scoped to the
+    must-fix items, then commits and pushes to the PR's own branch — never a
+    new PR — replying politely to each addressed comment.
+
+    Exit codes: 0 success · 1 no convergence · 2 config error · 3 budget halt.
+    """
+    from pathlib import Path as _Path
+
+    from src.core.config import ConfigError
+    from src.core.gitflow import GitSafetyError
+    from src.github.followup import FollowupError, run_followup
+    from src.github.issue_fetcher import GitHubAPIError
+    from src.gui.live_panel import LiveRunView
+
+    cfg = _load_repo_config(local_repo_path)
+    effective_model = _resolve_model(obj, cfg)
+    _apply_fallback_models(cfg)
+    eff_token = token_budget if token_budget is not None else cfg.token_budget
+    eff_time = time_budget if time_budget is not None else cfg.time_budget
+    eff_min = min_credits if min_credits is not None else cfg.min_credits
+    cap = (
+        max_iterations if max_iterations is not None
+        else (cfg.followup_max_iterations or 3)
+    )
+
+    render_credits_panel(CONSOLE)
+    live_view = LiveRunView(token_budget=eff_token)
+    live_view.start()
+    try:
+        outcome = run_followup(
+            pr_url=pr_url,
+            repo_path=_Path(local_repo_path),
+            model=effective_model,
+            max_iterations=cap,
+            token_budget=eff_token,
+            time_budget_seconds=eff_time,
+            min_remaining_credits=eff_min,
+            auto_install=auto_install,
+            use_cache=not no_cache,
+            event_sink=live_view.sink,
+        )
+    except (ConfigError, NotADirectoryError, ValueError) as exc:
+        CONSOLE.print(Panel(str(exc), title="[bold red]Configuration error[/]", border_style="red"))
+        raise SystemExit(EXIT_CONFIG_ERROR) from exc
+    except (GitHubAPIError, GitSafetyError, FollowupError) as exc:
+        CONSOLE.print(Panel(str(exc), title="[bold red]Follow-up failed[/]", border_style="red"))
+        raise SystemExit(EXIT_CONFIG_ERROR) from exc
+    finally:
+        live_view.finish()
+
+    if outcome.nothing_to_fix:
+        CONSOLE.print("[green]No must-fix review comments found — nothing to do.[/]")
+        raise SystemExit(EXIT_OK)
+
+    if outcome.commit_sha:
+        CONSOLE.print(f"[bold green]Commit:[/] {outcome.commit_sha[:10]} on [bold]{outcome.branch}[/]")
+    if outcome.replied_count:
+        CONSOLE.print(f"[green]Replied to {outcome.replied_count} comment(s).[/]")
+    if outcome.reviewers_requested:
+        CONSOLE.print(f"[green]Re-review requested from:[/] {', '.join(outcome.reviewers_requested)}")
+
+    if not outcome.success:
+        if outcome.halt_reason:
+            CONSOLE.print(f"[red]Halted:[/] {outcome.halt_reason}")
+        raise SystemExit(_halt_exit_code(outcome))
+
+
 @cli.command("gui")
 @click.option("--max-retries", "max_retries", default=-1, show_default=True,
               help="Hard cap on iterations in the GUI pipeline. -1 = run until "

@@ -42,6 +42,7 @@ evaluation milestone proves the pipeline reliable; set `pr.draft: false` in
 | `patchcraft fix [-r OWNER/REPO] ISSUE LOCAL_REPO_PATH` | Fetch one GitHub issue (URL or number) and solve it headlessly. `--push` also opens/updates a draft pull request. **The recommended entry point.** |
 | `patchcraft run REPO_PATH "ISSUE TEXT"` | Solve a locally described issue. |
 | `patchcraft select GITHUB_REPO LOCAL_REPO_PATH` | Browse open issues interactively and pick one (`--yes` = solve the first automatically). |
+| `patchcraft followup PR_URL LOCAL_REPO_PATH` | Address must-fix review comments on an existing PR, push to the same branch and reply to reviewers (never a new PR). |
 | `patchcraft ask "PROMPT"` | One-shot LLM query with automatic fallback. |
 | `patchcraft gui` | Interactive TUI (Textual) with credits widget and live log. |
 
@@ -85,6 +86,7 @@ ignore_globs:                                # excluded from indexing/context
   - "vendor/**"
   - "**/*_pb2.py"
 commit_style: conventional                   # conventional | repo-derived (git flow)
+followup_max_iterations: 3                   # hard cap for `patchcraft followup`
 pr:
   draft: true                                # open PRs as drafts (git flow)
 test:

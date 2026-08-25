@@ -808,6 +808,7 @@ def run_patchcraft_loop(
     issue_title: Optional[str] = None,
     allow_dirty: bool = False,
     github_repo: Optional[str] = None,
+    use_git_flow: bool = True,
 ) -> RunResult:
     """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
 
@@ -835,6 +836,7 @@ def run_patchcraft_loop(
             issue_title=issue_title,
             allow_dirty=allow_dirty,
             github_repo=github_repo,
+            use_git_flow=use_git_flow,
         )
     finally:
         memo.enabled, memo.base_dir = saved_enabled, saved_base_dir
@@ -864,6 +866,7 @@ def _run_patchcraft_loop_impl(
     issue_title: Optional[str] = None,
     allow_dirty: bool = False,
     github_repo: Optional[str] = None,
+    use_git_flow: bool = True,
 ) -> RunResult:
     """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
 
@@ -937,7 +940,9 @@ def _run_patchcraft_loop_impl(
     git_flow: Optional[GitFlow] = None
     worktree_path: Optional[Path] = None
     git_branch: Optional[str] = None
-    if GitFlow.is_git_repo(repo_root):
+    # Step 4.4: `use_git_flow=False` lets callers (e.g. `patchcraft followup`)
+    # manage git themselves and work directly on an existing branch.
+    if use_git_flow and GitFlow.is_git_repo(repo_root):
         git_flow = GitFlow(repo_root)
         git_flow.ensure_ready(allow_dirty=allow_dirty)  # raises GitSafetyError
         git_branch = build_branch_name(issue_number, issue_title)
