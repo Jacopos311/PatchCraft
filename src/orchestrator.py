@@ -43,7 +43,8 @@ from src.agents.coder import (
     generate_patch,
 )
 from src.agents.diagnostic import diagnose
-from src.agents.reporter import PatchReport, generate_report
+from src.agents.reporter import PatchReport, build_diff_stat, generate_report
+from src.core.repo_profile import RepoVoice, build_repo_voice
 from src.sandbox.runner import SandboxRunner, TestResult
 from src.sandbox.failures import extract_failures, format_failure_report
 from src.core.cache import (
@@ -683,6 +684,20 @@ def _patch_fingerprint(repo_root: Path, snapshots: dict[Path, Optional[str]]) ->
     return digest.hexdigest()
 
 
+def _build_test_evidence(selection, test_result) -> str:
+    """Compact, honest summary of what actually ran and passed (Step 4.3).
+
+    Only called on the success path, so ``exit code 0`` is a verified fact.
+    """
+    parts: list[str] = []
+    if selection is not None and getattr(selection, "has_targets", False):
+        targets = ", ".join(getattr(selection, "node_ids", []) or [])
+        parts.append(f"pytest (targeted): {targets}")
+    subset = getattr(test_result, "subset", "full")
+    parts.append(f"{subset} run: exit code 0")
+    return "; ".join(parts)
+
+
 def _run_tests_or_fallback(
     runner: SandboxRunner,
     repo_root: Path,
@@ -792,6 +807,7 @@ def run_patchcraft_loop(
     issue_number: Optional[int] = None,
     issue_title: Optional[str] = None,
     allow_dirty: bool = False,
+    github_repo: Optional[str] = None,
 ) -> RunResult:
     """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
 
@@ -818,6 +834,7 @@ def run_patchcraft_loop(
             issue_number=issue_number,
             issue_title=issue_title,
             allow_dirty=allow_dirty,
+            github_repo=github_repo,
         )
     finally:
         memo.enabled, memo.base_dir = saved_enabled, saved_base_dir
@@ -846,6 +863,7 @@ def _run_patchcraft_loop_impl(
     issue_number: Optional[int] = None,
     issue_title: Optional[str] = None,
     allow_dirty: bool = False,
+    github_repo: Optional[str] = None,
 ) -> RunResult:
     """Run the goal-driven Diagnosis -> Patch -> Test -> Self-Correction flow.
 
@@ -938,6 +956,17 @@ def _run_patchcraft_loop_impl(
         base_dir=main_repo_root / ".patchcraft" / "cache",
     )
     test_result_cache = TestResultCache(main_repo_root, enabled=use_cache)
+
+    # -- Step 4.3: repo voice profile (PR writer) ---------------------------
+    # Built from the user's checkout (so the cache persists), best-effort.
+    repo_voice: Optional[RepoVoice] = None
+    try:
+        repo_voice = build_repo_voice(
+            main_repo_root, github_repo=github_repo, fetch_prs=bool(github_repo)
+        )
+    except Exception as exc:  # noqa: BLE001 - voice must never break a run
+        logger.debug("Repo voice unavailable: %s: %s", type(exc).__name__, exc)
+        repo_voice = None
 
     # Guardrail defaults from the environment (explicit arguments win).
     if token_budget is None:
@@ -1175,8 +1204,19 @@ def _run_patchcraft_loop_impl(
             console.rule("[bold green]✅ Tests passed")
             diff = compute_diff(repo_root, original_snapshots)
             emit("diff", diff)
+            # Step 4.3: verified inputs only for the human-grade PR writer.
+            test_evidence = _build_test_evidence(selection, test_result)
+            diff_stat = build_diff_stat(diff)
             with console.status("📝 Generating report ..."):
-                report = generate_report(diff, model, usage_sink=usage_sink)
+                report = generate_report(
+                    diff,
+                    model,
+                    usage_sink=usage_sink,
+                    repo_voice=repo_voice,
+                    issue_text=issue_description,
+                    diff_stat=diff_stat,
+                    test_evidence=test_evidence,
+                )
             emit("report", report.pr_markdown if isinstance(report, PatchReport) else str(report))
             if isinstance(report, PatchReport):
                 console.print(Panel(

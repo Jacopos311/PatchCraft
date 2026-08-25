@@ -360,6 +360,7 @@ def select(
             issue_number=selected.get("number"),
             issue_title=title or None,
             allow_dirty=allow_dirty,
+            github_repo=github_repo,
         )
     except (NotADirectoryError, ValueError) as exc:
         CONSOLE.print(Panel(str(exc), title="[bold red]Configuration error[/]", border_style="red"))
@@ -499,6 +500,7 @@ def fix(
             issue_number=int(issue.get("number")) if issue.get("number") is not None else None,
             issue_title=title or None,
             allow_dirty=allow_dirty,
+            github_repo=repo,
         )
     except (NotADirectoryError, ValueError) as exc:
         CONSOLE.print(Panel(str(exc), title="[bold red]Configuration error[/]", border_style="red"))

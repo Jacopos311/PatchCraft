@@ -106,6 +106,11 @@ Rules:
   files that matter (no alphabetical dumps).
 * **Agents** — diagnostic → coder → self-correcting loop with structured
   failure reports fed back to the model.
+* **Human-grade PR writing** — the writer ingests the repo's own
+  `CONTRIBUTING.md`, PR templates and recent merged PR titles, builds the body
+  from *verified data only* (diff, tool-computed diff stat, real test
+  evidence), then runs a strict LLM self-review pass; fabricated
+  reviews/approvals are stripped by construction.
 * **Safety** — surgical patches applied atomically with snapshot/diff/rollback;
   sandboxed test runner with timeouts and process-tree kills; loop/stagnation
   detection; token/time/credit budgets.
